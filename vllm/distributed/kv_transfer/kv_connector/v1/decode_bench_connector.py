@@ -313,121 +313,76 @@ class DecodeBenchConnectorWorker:
         # Will be populated via register_kv_caches
         self.kv_caches: dict[str, torch.Tensor] | None = None
 
-        # Mapping from KV cache group index to list of layer names in that group
-        self.group_to_layers: dict[int, list[str]] | None = None
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Store references to the KV cache tensors and build group mapping."""
+        """Store KV cache references and pre-fill them in-place.
+
+        Pre-filling the entire cache once at registration avoids per-step
+        Python-loop overhead in start_fill_kv, which becomes a bottleneck
+        at high concurrency (>1000 req/rank). Since this is a benchmark-
+        only connector, the actual values are immaterial as long as the
+        statistical distribution matches fill_mean / fill_std.
+        """
         self.kv_caches = kv_caches
 
-        # For simplicity, assume all layers belong to group 0 (standard attention)
-        # For MLA models with multiple groups, the metadata will handle the mapping
-        # We just need to fill the blocks specified in the metadata
-        self.group_to_layers = {0: list(kv_caches.keys())}
+        # Chunk size (float32 elements) for the fp8 randomize path. 32M × 4 B
+        # = 128 MiB, well under the headroom left after KV-profile sizing.
+        CHUNK_ELEMS = 1 << 25
+        staging: torch.Tensor | None = None
 
-        logger.debug(
-            "DecodeBenchConnector: Registered %d KV cache layers",
-            len(kv_caches),
-        )
-
-    def start_fill_kv(self, metadata: DecodeBenchConnectorMetadata):
-        """
-        Fill the allocated KV cache blocks with dummy (non-zero) values.
-
-        This simulates having a populated KV cache from a prefill phase,
-        allowing decode performance testing with larger context sizes.
-
-        Supports both standard attention (single group) and MLA (multiple groups).
-        """
-        if not metadata.reqs_to_fill:
-            return
-
-        assert self.kv_caches is not None, "KV caches must be registered before filling"
-        assert self.group_to_layers is not None, "Group mapping must be initialized"
-
-        for req_id, (block_ids_per_group, num_tokens) in metadata.reqs_to_fill.items():
-            # Fill blocks for each KV cache group
-            for group_idx, block_ids in enumerate(block_ids_per_group):
-                self._fill_blocks(group_idx, block_ids, num_tokens)
-
-            logger.debug(
-                "DecodeBenchConnector: Filled %d blocks (%d tokens) across %d groups "
-                "for request %s",
-                len(block_ids_per_group[0]) if block_ids_per_group else 0,
-                num_tokens,
-                len(block_ids_per_group),
-                req_id,
-            )
-
-    def _fill_blocks(self, group_idx: int, block_ids: list[int], num_tokens: int):
-        """
-        Fill specified blocks with dummy non-zero values for a specific KV cache group.
-
-        Args:
-            group_idx: The KV cache group index to fill
-            block_ids: List of block IDs to fill in this group
-            num_tokens: Total number of tokens to fill across these blocks
-        """
-        if not block_ids:
-            return
-
-        assert self.kv_caches is not None
-        assert self.group_to_layers is not None
-
-        # Get the layers that belong to this group
-        layer_names = self.group_to_layers.get(group_idx, [])
-
-        # Fill only the layers in this group
-        for layer_name in layer_names:
-            if layer_name not in self.kv_caches:
-                logger.warning(
-                    "DecodeBenchConnector: Layer %s not found in KV caches", layer_name
-                )
-                continue
-
-            kv_cache = self.kv_caches[layer_name]
-
-            # Convert block_ids to tensor on device
-            block_ids_tensor = torch.tensor(
-                block_ids, dtype=torch.long, device=kv_cache.device
-            )
-
-            # Filter invalid block IDs
-            valid_mask = block_ids_tensor < kv_cache.shape[0]
-            valid_block_ids = block_ids_tensor[valid_mask]
-
-            if len(valid_block_ids) == 0:
-                continue
-
-            # Create fill values - either constant or random
-            block_shape = kv_cache.shape[1:]
-            if self.fill_std > 0:
-                # Random normal sampling
-                fill_values = torch.normal(
-                    mean=self.fill_mean,
-                    std=self.fill_std,
-                    size=(len(valid_block_ids),) + block_shape,
-                    dtype=kv_cache.dtype,
-                    device=kv_cache.device,
-                )
+        for cache in kv_caches.values():
+            if cache.is_floating_point():
+                # Native float path (bf16/fp16/fp32/fp8-float views). normal_
+                # and fill_ both work in float space.
+                if self.fill_std > 0:
+                    cache.normal_(mean=self.fill_mean, std=self.fill_std)
+                else:
+                    cache.fill_(self.fill_mean)
             else:
-                # Constant fill value
-                fill_values = torch.full(
-                    (len(valid_block_ids),) + block_shape,
-                    self.fill_mean,
-                    dtype=kv_cache.dtype,
-                    device=kv_cache.device,
-                )
+                # Integer storage — typically uint8 holding fp8 bytes.
+                # normal_/fill_ can't produce meaningful float distributions on
+                # integer tensors, so we reinterpret as fp8 and (for fill_std
+                # > 0) sample float32 in small chunks and copy_ across (lossy
+                # float32→fp8 cast). Allocating a full-shape float32 scratch
+                # here OOMs on large MLA KV caches (the profile has already
+                # claimed the headroom), hence the chunked staging buffer.
+                # Defaults to e4m3fn which matches vLLM's `--kv-cache-dtype
+                # fp8` and DeepSeek-MLA `fp8_ds_mla` layout.
+                fp8_view = cache.view(torch.float8_e4m3fn)
+                if self.fill_std > 0:
+                    flat = fp8_view.reshape(-1)
+                    numel = flat.numel()
+                    if staging is None:
+                        staging = torch.empty(
+                            min(CHUNK_ELEMS, numel),
+                            dtype=torch.float32,
+                            device=cache.device,
+                        )
+                    for start in range(0, numel, CHUNK_ELEMS):
+                        end = min(start + CHUNK_ELEMS, numel)
+                        buf = staging[: end - start]
+                        buf.normal_(mean=self.fill_mean, std=self.fill_std)
+                        flat[start:end].copy_(buf)
+                else:
+                    fp8_view.fill_(self.fill_mean)
 
-            # Batch fill operation
-            kv_cache[valid_block_ids] = fill_values
+        # Release the shared staging buffer before returning so the KV pool
+        # has its full budget available for serving.
+        del staging
 
-        logger.debug(
-            "DecodeBenchConnector: Filled %d blocks in group %d with %s values "
-            "(mean=%.3f, std=%.3f)",
-            len(block_ids),
-            group_idx,
+        logger.info(
+            "DecodeBenchConnector: Pre-filled %d KV cache layers with "
+            "%s values (mean=%.3f, std=%.3f)",
+            len(kv_caches),
             "random" if self.fill_std > 0 else "constant",
             self.fill_mean,
             self.fill_std,
         )
+
+    def start_fill_kv(self, metadata: DecodeBenchConnectorMetadata):
+        """No-op: KV cache is pre-filled once at register_kv_caches time.
+
+        At high concurrency the old per-request per-layer fill loop became
+        a host-side bottleneck. The metadata is still populated by the
+        scheduler (for protocol compatibility) but is ignored here.
+        """
+        return
