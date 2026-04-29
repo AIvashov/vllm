@@ -156,6 +156,16 @@ def _child_base_url(args: argparse.Namespace, port: int) -> str:
     return f"http://{host}:{port}"
 
 
+def _join_processes_with_timeout(processes: list[BaseProcess], timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    for process in processes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if process.is_alive():
+            process.join(timeout=remaining)
+
+
 async def _probe_endpoint(
     session: aiohttp.ClientSession,
     args: argparse.Namespace,
@@ -426,23 +436,17 @@ class MultiPortExternalLBSupervisor:
                 self.args.shutdown_timeout,
                 DEFAULT_CHILD_GRACEFUL_TERMINATION,
             )
-            deadline = time.monotonic() + timeout
             for process in self.processes:
                 if not process.is_alive() or (pid := process.pid) is None:
                     continue
                 with contextlib.suppress(ProcessLookupError, OSError):
                     os.killpg(pid, self._shutdown_signal)
 
-            while time.monotonic() < deadline:
-                alive = False
-                for process in self.processes:
-                    if not process.is_alive():
-                        continue
-                    alive = True
-                    process.join(timeout=0)
-                if not alive:
-                    break
-                await asyncio.sleep(0.1)
+            await asyncio.to_thread(
+                _join_processes_with_timeout,
+                self.processes,
+                timeout,
+            )
 
             for process in self.processes:
                 if process.is_alive() and (pid := process.pid) is not None:
