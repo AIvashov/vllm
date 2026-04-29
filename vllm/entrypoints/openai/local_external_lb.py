@@ -12,7 +12,6 @@ import multiprocessing
 import os
 import signal
 import time
-from dataclasses import dataclass
 from functools import partial
 from http import HTTPStatus
 from multiprocessing.process import BaseProcess
@@ -181,17 +180,6 @@ async def _probe_endpoint(
         return False, str(exc)
 
 
-@dataclass
-class MultiPortExternalLBChildStatus:
-    local_rank: int
-    data_parallel_rank: int
-    port: int
-    pid: int | None = None
-    healthy: bool = False
-    exitcode: int | None = None
-    last_error: str | None = None
-
-
 def _build_multi_port_external_lb_supervisor_app(
     supervisor: MultiPortExternalLBSupervisor,
 ) -> FastAPI:
@@ -233,16 +221,11 @@ class MultiPortExternalLBSupervisor:
         validate_multi_port_external_lb_args(args)
         self.args = args
         self.supervisor_port = args.data_parallel_supervisor_port
-        self.child_specs = [
-            MultiPortExternalLBChildStatus(
-                local_rank=local_rank,
-                data_parallel_rank=infer_multi_port_external_lb_start_rank(args)
-                + local_rank,
-                port=args.port + local_rank,
-            )
+        self.child_ports = [
+            args.port + local_rank
             for local_rank in range(args.data_parallel_size_local)
         ]
-        self.child_statuses = copy.deepcopy(self.child_specs)
+        self.child_health = [False] * len(self.child_ports)
         self.processes: list[BaseProcess] = []
         self._stop_requested = asyncio.Event()
         self._failed_process: BaseProcess | None = None
@@ -255,8 +238,10 @@ class MultiPortExternalLBSupervisor:
         self._shutting_down = True
 
     def is_healthy(self) -> bool:
-        return not self._shutting_down and all(
-            child.healthy and child.exitcode is None for child in self.child_statuses
+        return (
+            not self._shutting_down
+            and len(self.child_health) == len(self.child_ports)
+            and all(self.child_health)
         )
 
     async def run(self) -> None:
@@ -359,24 +344,14 @@ class MultiPortExternalLBSupervisor:
             process.start()
             self.processes.append(process)
 
-    async def _collect_child_status(
-        self,
-        session: aiohttp.ClientSession,
-        spec: MultiPortExternalLBChildStatus,
-        process: BaseProcess,
-    ) -> MultiPortExternalLBChildStatus:
-        status = copy.copy(spec)
-        status.pid = process.pid
-        status.exitcode = process.exitcode
-
+    async def _collect_child_health(
+        self, session: aiohttp.ClientSession, port: int, process: BaseProcess
+    ) -> bool:
         if process.exitcode is not None:
-            status.last_error = f"process exited with code {process.exitcode}"
-            return status
+            return False
 
-        status.healthy, status.last_error = await _probe_endpoint(
-            session, self.args, status.port, "/health"
-        )
-        return status
+        healthy, _ = await _probe_endpoint(session, self.args, port, "/health")
+        return healthy
 
     async def _monitor_children(self) -> None:
         timeout = aiohttp.ClientTimeout(total=HEALTHCHECK_TIMEOUT_S)
@@ -385,13 +360,12 @@ class MultiPortExternalLBSupervisor:
                 await self._raise_if_supervisor_server_stopped(
                     "Multi-port external LB supervisor exited unexpectedly"
                 )
-                statuses = await asyncio.gather(
+                self.child_health = await asyncio.gather(
                     *(
-                        self._collect_child_status(session, spec, process)
-                        for spec, process in zip(self.child_specs, self.processes)
+                        self._collect_child_health(session, port, process)
+                        for port, process in zip(self.child_ports, self.processes)
                     )
                 )
-                self.child_statuses = statuses
                 self._failed_process = next(
                     (
                         process

@@ -4,7 +4,6 @@
 import argparse
 
 from vllm.entrypoints.openai.local_external_lb import (
-    MultiPortExternalLBChildStatus,
     MultiPortExternalLBSupervisor,
     build_multi_port_external_lb_child_args,
     infer_multi_port_external_lb_start_rank,
@@ -59,19 +58,14 @@ def test_build_multi_port_external_lb_child_args_sets_external_rank_server():
 def test_multi_port_external_lb_supervisor_aggregates_health():
     supervisor = MultiPortExternalLBSupervisor(_make_args())
 
-    supervisor.child_statuses = [
-        MultiPortExternalLBChildStatus(0, 4, 8000, healthy=True),
-        MultiPortExternalLBChildStatus(1, 5, 8001, healthy=True),
-    ]
+    supervisor.child_health = [True, True, True, True]
 
     assert supervisor.is_healthy() is True
 
 
 def test_multi_port_external_lb_supervisor_is_unhealthy_while_shutting_down():
     supervisor = MultiPortExternalLBSupervisor(_make_args())
-    supervisor.child_statuses = [
-        MultiPortExternalLBChildStatus(0, 4, 8000, healthy=True)
-    ]
+    supervisor.child_health = [True, True, True, True]
     supervisor.begin_shutdown()
 
     assert supervisor.is_healthy() is False
