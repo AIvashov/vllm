@@ -143,8 +143,8 @@ class KernelConfig:
     - "deep_gemm": Use DeepGEMM kernels (FP8 block-quantized only)
     - "deep_gemm_mega_moe": Use DeepGEMM mega MoE kernels
     - "cutlass": Use vLLM CUTLASS kernels
-    - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels (BF16 output)
-    - "flashinfer_trtllm_afp8": Use FlashInfer with TRTLLM-GEN kernels (FP8 output)
+    - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels (BF16 input)
+    - "flashinfer_trtllm_afp8": Use FlashInfer with TRTLLM-GEN kernels (FP8 input)
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels (BF16 output)
     - "flashinfer_cutlass_afp8": Use FlashInfer with CUTLASS kernels (FP8 output)
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
