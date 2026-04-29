@@ -188,7 +188,6 @@ class MultiPortExternalLBChildStatus:
     port: int
     pid: int | None = None
     healthy: bool = False
-    ready: bool = False
     exitcode: int | None = None
     last_error: str | None = None
 
@@ -209,11 +208,6 @@ class MultiPortExternalLBState:
             child.healthy and child.exitcode is None for child in self._children
         )
 
-    def is_ready(self) -> bool:
-        return not self._shutting_down and all(
-            child.ready and child.exitcode is None for child in self._children
-        )
-
 
 def _build_multi_port_external_lb_supervisor_app(
     state: MultiPortExternalLBState,
@@ -232,7 +226,8 @@ def _build_multi_port_external_lb_supervisor_app(
     @app.get("/ready", include_in_schema=False)
     @app.get("/readyz", include_in_schema=False)
     async def ready() -> Response:
-        return _status_response(state.is_ready())
+        # when child servers is healthy, it is ready already
+        return _status_response(state.is_healthy())
 
     return app
 
@@ -389,10 +384,6 @@ class MultiPortExternalLBSupervisor:
         status.healthy, status.last_error = await _probe_endpoint(
             session, self.args, status.port, "/health"
         )
-        if status.healthy:
-            status.ready, status.last_error = await _probe_endpoint(
-                session, self.args, status.port, "/v1/models"
-            )
         return status
 
     async def _monitor_children(self) -> None:

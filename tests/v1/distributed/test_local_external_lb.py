@@ -56,7 +56,7 @@ def test_build_multi_port_external_lb_child_args_sets_external_rank_server():
     assert child_args.api_server_count == 1
 
 
-def test_multi_port_external_lb_state_aggregates_status():
+def test_multi_port_external_lb_state_aggregates_health():
     state = MultiPortExternalLBState(
         [
             MultiPortExternalLBChildStatus(0, 4, 8000),
@@ -66,20 +66,18 @@ def test_multi_port_external_lb_state_aggregates_status():
 
     state.update_children(
         [
-            MultiPortExternalLBChildStatus(0, 4, 8000, healthy=True, ready=True),
-            MultiPortExternalLBChildStatus(1, 5, 8001, healthy=True, ready=False),
+            MultiPortExternalLBChildStatus(0, 4, 8000, healthy=True),
+            MultiPortExternalLBChildStatus(1, 5, 8001, healthy=True),
         ],
     )
 
     assert state.is_healthy() is True
-    assert state.is_ready() is False
 
 
 def test_multi_port_external_lb_state_marks_unhealthy_while_shutting_down():
     state = MultiPortExternalLBState(
-        [MultiPortExternalLBChildStatus(0, 4, 8000, healthy=True, ready=True)]
+        [MultiPortExternalLBChildStatus(0, 4, 8000, healthy=True)]
     )
     state.begin_shutdown()
 
     assert state.is_healthy() is False
-    assert state.is_ready() is False
