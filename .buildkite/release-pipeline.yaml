@@ -401,6 +401,7 @@ steps:
           - "docker manifest push public.ecr.aws/q9t5s3a7/vllm-release-repo:$BUILDKITE_COMMIT-cu129-ubuntu2404"
 
       - label: "Publish nightly multi-arch image to DockerHub"
+        key: publish-nightly-image-dockerhub
         depends_on:
           - create-multi-arch-manifest
         if: build.env("NIGHTLY") == "1"
@@ -417,6 +418,21 @@ steps:
         env:
           DOCKER_BUILDKIT: "1"
           DOCKERHUB_USERNAME: "vllmbot"
+
+      - label: ":microscope: Trigger perf-eval for nightly image"
+        depends_on:
+          - publish-nightly-image-dockerhub
+        if: build.env("NIGHTLY") == "1"
+        trigger: "perf-eval"
+        async: true
+        build:
+          branch: "main"
+          commit: "HEAD"
+          message: "Evaluate vLLM nightly ${BUILDKITE_COMMIT}"
+          env:
+            TRIGGER_MODE: "nightly"
+            VLLM_COMMIT: "${BUILDKITE_COMMIT}"
+            VLLM_IMAGE: "vllm/vllm-openai:nightly-${BUILDKITE_COMMIT}"
 
       - label: "Publish nightly multi-arch image to DockerHub - CUDA 12.9"
         depends_on:
