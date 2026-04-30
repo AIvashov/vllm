@@ -58,7 +58,6 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             "For quantized MoE, mix LoRAExpertsMixin into the experts class "
             "and consume self._lora_context in apply()."
         )
-        self._fused_experts = moe_kernel.fused_experts
         self._moe_kernel = moe_kernel
         self.base_layer._replace_quant_method(
             FusedMoEModularMethod(self.base_layer.quant_method, moe_kernel)
@@ -361,7 +360,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def set_mapping(self, punica_wrapper):
         super().set_mapping(punica_wrapper)
         lora_context = self._build_lora_context()
-        self._fused_experts.set_lora_context(lora_context)
+        self._moe_kernel.fused_experts.set_lora_context(lora_context)
         prepare_finalize = self._moe_kernel.prepare_finalize
         if hasattr(prepare_finalize, "set_lora_context"):
             prepare_finalize.set_lora_context(lora_context)
