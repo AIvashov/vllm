@@ -405,6 +405,38 @@ def has_deep_ep() -> bool:
     return _has_module("deep_ep")
 
 
+DEEPEP_V2_MIN_NCCL_VERSION = (4, 30, 4)
+
+
+def has_deep_ep_v2() -> bool:
+    """Whether deep_ep with ElasticBuffer (v2 API) is available.
+
+    Requires both the ElasticBuffer class in the deep_ep module and
+    NCCL >= 4.30.4 (GIN backend).
+    """
+    if not _has_module("deep_ep"):
+        return False
+    import deep_ep  # type: ignore[import-not-found]
+
+    if not hasattr(deep_ep, "ElasticBuffer"):
+        return False
+    try:
+        import torch
+
+        nccl_ver = torch.cuda.nccl.version()
+        if nccl_ver < DEEPEP_V2_MIN_NCCL_VERSION:
+            logger.info_once(
+                "DeepEP v2 requires NCCL >= %s but found %s. "
+                "deepep_v2 backend will not be available.",
+                ".".join(str(v) for v in DEEPEP_V2_MIN_NCCL_VERSION),
+                ".".join(str(v) for v in nccl_ver),
+            )
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def has_deep_gemm() -> bool:
     """Whether the optional `deep_gemm` package is available.
 
