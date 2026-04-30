@@ -150,13 +150,11 @@ def test_full_graph(
         if is_torch_equal_or_newer("2.9.0.dev")
     ]
     + [
-        # Test get_raw_stream patch with compile_sizes
-        # This tests that TorchInductor autotune works correctly with get_raw_stream
-        # patch in torch 2.9 and without patch in torch 2.10+
+        # Cover compile_sizes autotune path.
         (
             CompilationConfig(
                 mode=CompilationMode.VLLM_COMPILE,
-                compile_sizes=[1, 2],  # Triggers autotune which uses get_raw_stream
+                compile_sizes=[1, 2],  # Triggers the autotune path.
                 cudagraph_mode=CUDAGraphMode.NONE,
             ),
             "facebook/opt-125m",
