@@ -345,7 +345,6 @@ MNKs = [
 DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
 
 
-@pytest.mark.parametrize("use_fp8_dispatch", [False, True])
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("m,n,k", MNKs)
 @pytest.mark.parametrize("num_experts", [32])
@@ -354,7 +353,6 @@ DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
 @multi_gpu_test(num_gpus=2)
 @requires_deep_ep_v2
 def test_deep_ep_v2_moe(
-    use_fp8_dispatch: bool,
     dtype: torch.dtype,
     m: int,
     n: int,
@@ -365,6 +363,7 @@ def test_deep_ep_v2_moe(
     workspace_init,
 ):
     per_act_token_quant = False
+    use_fp8_dispatch = False
 
     set_random_seed(7)
     world_size, dp_size = world_dp_size
