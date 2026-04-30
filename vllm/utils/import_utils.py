@@ -405,14 +405,14 @@ def has_deep_ep() -> bool:
     return _has_module("deep_ep")
 
 
-DEEPEP_V2_MIN_NCCL_VERSION = (4, 30, 4)
+DEEPEP_V2_MIN_NCCL_VERSION = (2, 30, 4)
 
 
 def has_deep_ep_v2() -> bool:
     """Whether deep_ep with ElasticBuffer (v2 API) is available.
 
     Requires both the ElasticBuffer class in the deep_ep module and
-    NCCL >= 4.30.4 (GIN backend).
+    NCCL >= 2.30.4 (GIN backend).
     """
     if not _has_module("deep_ep"):
         return False

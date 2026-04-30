@@ -771,7 +771,7 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
     def __init__(self, cpu_group, tcp_store_group=None):
         assert has_deep_ep_v2(), (
             "DeepEP v2 (ElasticBuffer) not available. Requires DeepEP >= 2.0 "
-            "(https://github.com/deepseek-ai/DeepEP) and NCCL >= 4.30.4."
+            "(https://github.com/deepseek-ai/DeepEP) and NCCL >= 2.30.4."
         )
         super().__init__(cpu_group, tcp_store_group)
         self.handle_cache = Cache()

@@ -197,7 +197,7 @@ requires_ptrace = pytest.mark.skipif(
 )
 requires_deep_ep_v2 = pytest.mark.skipif(
     not has_deep_ep_v2(),
-    reason="DeepEP v2 (ElasticBuffer) not available or NCCL < 4.30.4",
+    reason="DeepEP v2 (ElasticBuffer) not available or NCCL < 2.30.4",
 )
 
 # NOTE: No module-level pytestmark here. The FlashInfer lifecycle tests have
@@ -784,7 +784,7 @@ def test_one_sided_dispatch_combine(world_size):
 # ---------------------------------------------------------------------------
 #
 # Tests DeepEPV2All2AllManager which wraps DeepEP's ElasticBuffer API using
-# the NCCL GIN backend. Requires DeepEP >= 2.0 and NCCL >= 4.30.4.
+# the NCCL GIN backend. Requires DeepEP >= 2.0 and NCCL >= 2.30.4.
 #
 # Uses EP group because the DeepEP v2 manager is constructed with an
 # EP-scoped communicator in production. With tp=world_size the EP group
