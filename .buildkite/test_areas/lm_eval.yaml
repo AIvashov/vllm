@@ -39,6 +39,7 @@ steps:
   timeout_in_minutes: 120
   device: b200
   optional: true
+  num_devices: 2
   source_file_dependencies:
   - csrc/
   - vllm/model_executor/layers/quantization

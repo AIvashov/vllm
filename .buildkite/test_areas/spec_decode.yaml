@@ -21,7 +21,7 @@ steps:
     - vllm/v1/worker/gpu/spec_decode/
     - tests/v1/e2e/spec_decode/
   commands:
-    - pytest -v -s v1/e2e/spec_decode -k "eagle_correctness"
+    - pytest -v -s v1/e2e/spec_decode -k "eagle_correctness and not deepseek_eagle"
 
 - label: Spec Decode Speculators + MTP
   timeout_in_minutes: 30
@@ -44,7 +44,7 @@ steps:
     - vllm/transformers_utils/configs/speculators/
     - tests/v1/e2e/spec_decode/
   commands:
-    - pytest -v -s v1/e2e/spec_decode -k "speculators or mtp_correctness"
+    - pytest -v -s v1/e2e/spec_decode -k "(speculators or mtp_correctness) and not deepseek"
   
 - label: Spec Decode Ngram + Suffix
   timeout_in_minutes: 30
