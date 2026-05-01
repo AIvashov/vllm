@@ -793,6 +793,7 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             allow_hybrid_mode=envs.VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE,
             prefer_overlap_with_compute=envs.VLLM_DEEPEP_V2_PREFER_OVERLAP,
             allow_multiple_reduction=(envs.VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION),
+            explicitly_destroy=True,
         )
 
     def get_handle(self, kwargs):

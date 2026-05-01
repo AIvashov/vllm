@@ -383,3 +383,155 @@ def test_deep_ep_v2_moe(
         use_fp8_dispatch,
         per_act_token_quant,
     )
+
+
+def _deep_ep_v2_moe_cudagraph(
+    pgi: ProcessGroupInfo,
+    dp_size: int,
+    config: TestConfig,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+):
+    """Worker function: verify DeepEP v2 MoE works under cudagraph capture."""
+    device = torch.device(f"cuda:{pgi.local_rank}")
+    init_workspace_manager(device)
+
+    device_idx = torch.accelerator.current_device_index()
+    w1 = w1.to(device=device_idx)
+    w2 = w2.to(device=device_idx)
+
+    pg = torch.distributed.new_group(list(range(pgi.world_size)))
+    test_tensors = TestTensors.make(config)
+
+    num_local_experts = config.num_experts // pgi.world_size
+    e_start = num_local_experts * pgi.rank
+    e_end = e_start + num_local_experts
+    w1_ep = w1[e_start:e_end]
+    w2_ep = w2[e_start:e_end]
+
+    with set_current_vllm_config(VllmConfig()):
+        # Reference
+        torch_combined = torch_moe_impl(
+            test_tensors, w1, w2, None, None, False,
+        )
+
+        # Build kernel
+        num_local_experts = w1_ep.size(0)
+        hidden_size = test_tensors.rank_tokens.size(1)
+
+        quant_config = FusedMoEQuantConfig.make(None)
+
+        mk_kernel = make_modular_kernel(
+            pg, pgi, dp_size, hidden_size,
+            config.num_experts, num_local_experts,
+            config.topk, None, False, quant_config,
+        )
+
+        def build_expert_map():
+            expert_map = torch.full(
+                (config.num_experts,), fill_value=-1, dtype=torch.int32,
+            )
+            s = pgi.rank * num_local_experts
+            expert_map[s:s + num_local_experts] = torch.tensor(
+                list(range(num_local_experts)),
+            )
+            return expert_map.to(device=device_idx, dtype=torch.int32)
+
+        expert_map = build_expert_map()
+
+        # Warmup (non-captured)
+        out = mk_kernel.apply(
+            hidden_states=test_tensors.rank_tokens,
+            w1=w1_ep, w2=w2_ep,
+            topk_weights=test_tensors.topk_weights,
+            topk_ids=test_tensors.topk,
+            activation=MoEActivation.SILU,
+            global_num_experts=config.num_experts,
+            expert_map=expert_map,
+            apply_router_weight_on_input=False,
+        )
+
+        torch.testing.assert_close(
+            torch_combined, out, atol=6e-2, rtol=6e-2,
+        )
+
+        # Cudagraph capture
+        torch.cuda.synchronize()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+
+        # Warmup on capture stream
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                mk_kernel.apply(
+                    hidden_states=test_tensors.rank_tokens,
+                    w1=w1_ep, w2=w2_ep,
+                    topk_weights=test_tensors.topk_weights,
+                    topk_ids=test_tensors.topk,
+                    activation=MoEActivation.SILU,
+                    global_num_experts=config.num_experts,
+                    expert_map=expert_map,
+                    apply_router_weight_on_input=False,
+                )
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+
+        # Capture
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=s):
+            graph_out = mk_kernel.apply(
+                hidden_states=test_tensors.rank_tokens,
+                w1=w1_ep, w2=w2_ep,
+                topk_weights=test_tensors.topk_weights,
+                topk_ids=test_tensors.topk,
+                activation=MoEActivation.SILU,
+                global_num_experts=config.num_experts,
+                expert_map=expert_map,
+                apply_router_weight_on_input=False,
+            )
+
+        # Replay
+        g.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            torch_combined, graph_out, atol=6e-2, rtol=6e-2,
+        )
+
+
+@pytest.mark.parametrize("m,n,k", [(32, 256, 1024)])
+@pytest.mark.parametrize("num_experts", [32])
+@pytest.mark.parametrize("topk", [6])
+@pytest.mark.parametrize("world_dp_size", [(2, 1)])
+@multi_gpu_test(num_gpus=2)
+@requires_deep_ep_v2
+def test_deep_ep_v2_moe_cudagraph(
+    m: int,
+    n: int,
+    k: int,
+    num_experts: int,
+    topk: int,
+    world_dp_size: tuple[int, int],
+    workspace_init,
+):
+    set_random_seed(7)
+    world_size, dp_size = world_dp_size
+    config = TestConfig(
+        dtype=torch.bfloat16, topk=topk, m=m, k=k, n=n,
+        num_experts=num_experts,
+    )
+
+    w1, w2, _, _ = make_weights(num_experts, n, k, torch.bfloat16)
+
+    parallel_launch(
+        world_size,
+        _deep_ep_v2_moe_cudagraph,
+        dp_size,
+        config,
+        w1,
+        w2,
+        None,
+        None,
+    )

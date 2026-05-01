@@ -15,13 +15,6 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
-    dbo_enabled,
-    dbo_get_previous_event,
-    dbo_switch_to_comm,
-    dbo_switch_to_compute,
-    dbo_switch_to_compute_sync,
-    dbo_yield_and_switch_from_comm_to_compute,
-    dbo_yield_and_switch_from_compute_to_comm,
 )
 
 
@@ -32,6 +25,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     Uses do_expand=True so dispatch produces per-expert-contiguous layout:
     each (token, expert) pair gets its own row, with expert regions contiguous.
     Combine handles weighted reduction internally.
+
+    Uses synchronous dispatch/combine (async_with_compute_stream=False).
+    The ElasticBuffer still runs comm kernels on its internal comm_stream;
+    setting async=False just means the caller's stream waits for completion.
+    This is cudagraph-compatible and DBO-compatible.
     """
 
     @staticmethod
@@ -62,7 +60,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.num_experts = num_experts
         self.num_topk = num_topk
         self.use_fp8_dispatch = use_fp8_dispatch
-        self.async_prepare = True
 
         # DBO microbatching: one handle slot per micro-batch.
         self.handles: list[deep_ep.EPHandle | None] = [None, None]
@@ -96,10 +93,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> Callable:
         has_scales = token_scales is not None
 
-        previous_event = dbo_get_previous_event(self.buffer.capture)
-
-        dbo_yield_and_switch_from_compute_to_comm()
-
         token_data = tokens
         if has_scales:
             token_data = (tokens, token_scales)
@@ -115,15 +108,13 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             topk_idx=rank_topk_ids,
             topk_weights=rank_topk_weights,
             num_experts=num_experts,
-            do_expand=True,
-            previous_event=previous_event,
-            async_with_compute_stream=(self.async_prepare and not dbo_enabled()),
+            do_expand=False,
+            do_cpu_sync=False,
+            async_with_compute_stream=False,
         )
 
         a2a_idx = dbo_current_ubatch_id()
         self.handles[a2a_idx] = handle
-
-        dbo_switch_to_compute_sync()
 
         return lambda: self._receiver(
             event,
@@ -133,6 +124,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             num_experts,
             handle.num_recv_tokens_per_expert_list,
             recv_topk_weights,
+            handle.psum_num_recv_tokens_per_scaleup_rank,
             a1_scale,
             quant_config,
             defer_input_quant=defer_input_quant,
@@ -147,6 +139,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         num_experts: int,
         recv_expert_num_tokens: list[int],
         recv_topk_weights: torch.Tensor | None,
+        psum_recv_per_rank: torch.Tensor,
         a1_scale: torch.Tensor | None,
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
@@ -159,46 +152,57 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         else:
             expert_x, expert_x_scale = recv_x, None
 
-        # With do_expand=True, recv_topk_idx is None — expert assignment
+        # With do_expand=True, recv_topk_idx is None -- expert assignment
         # is implicit in the per-expert-contiguous layout. Build topk_ids
         # from num_recv_tokens_per_expert_list so TritonExperts can index
         # into the right expert weights.
-        if recv_topk_idx is None:
-            recv_topk_idx = (
-                torch.cat(
-                    [
-                        torch.full(
-                            (count,),
-                            i + self.rank_expert_offset,
-                            dtype=torch.int64,
-                            device=expert_x.device,
-                        )
-                        for i, count in enumerate(recv_expert_num_tokens)
-                        if count > 0
-                    ]
-                )
-                if expert_x.numel() > 0
-                else torch.empty(
-                    0,
-                    dtype=torch.int64,
-                    device=expert_x.device,
-                )
-            )
-            recv_topk_idx = recv_topk_idx.unsqueeze(1)
-        else:
-            recv_topk_idx = torch.where(
-                recv_topk_idx == -1,
-                num_experts - 1 if self.rank_expert_offset == 0 else 0,
-                recv_topk_idx + self.rank_expert_offset,
-            )
+        # With do_expand=False, recv_topk_idx contains global expert IDs.
+        # The expert_map (passed to mk.apply) handles global->local remapping.
+        #
+        # With do_cpu_sync=False, the recv tensors are worst-case allocated
+        # (num_max_tokens_per_rank rows). Rows beyond the actual received
+        # count contain garbage data and stale expert IDs that may point
+        # to real experts, causing illegal memory access in expert kernels.
+        # Use psum_num_recv_tokens_per_scaleup_rank (a GPU tensor giving
+        # the inclusive prefix sum of deduped received tokens per rank)
+        # to identify padding rows and sanitize them.
+        total_rows = expert_x.shape[0]
+        # psum_recv_per_rank[-1] = total deduped received tokens
+        num_real = psum_recv_per_rank[-1]  # GPU scalar tensor
+
+        # Build a per-row mask: True for padding rows (index >= num_real)
+        row_indices = torch.arange(
+            total_rows, device=expert_x.device, dtype=num_real.dtype
+        )
+        is_padding_row = row_indices >= num_real  # [N]
+        is_padding_row = is_padding_row.unsqueeze(1)  # [N, 1]
+
+        # Sanitize padding: zero hidden states, set expert IDs to a valid
+        # local expert, and zero weights so padding doesn't contribute.
+        expert_x.masked_fill_(is_padding_row, 0.0)
+        if expert_x_scale is not None:
+            expert_x_scale.masked_fill_(is_padding_row, 0.0)
+        recv_topk_idx = torch.where(
+            is_padding_row,
+            self.rank_expert_offset,
+            recv_topk_idx,
+        )
+        # Also remap any -1 entries in real rows (tokens with fewer
+        # than num_topk valid expert selections).
+        recv_topk_idx = torch.where(
+            recv_topk_idx == -1,
+            self.rank_expert_offset,
+            recv_topk_idx,
+        )
 
         # Reshape recv_topk_weights to match recv_topk_idx shape [N, 1]
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
             recv_topk_weights = recv_topk_weights.unsqueeze(1)
 
-        expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
-            recv_expert_num_tokens, device=expert_x.device
-        )
+        if recv_topk_weights is not None:
+            recv_topk_weights.masked_fill_(is_padding_row, 0.0)
+
+        expert_tokens_meta = None
 
         if not quant_config.is_block_quantized and not defer_input_quant:
             expert_x_scale = None
@@ -320,8 +324,6 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
 
-        previous_event = dbo_get_previous_event(self.buffer.capture)
-        dbo_yield_and_switch_from_compute_to_comm()
         if fused_expert_output.dtype != torch.bfloat16:
             raise ValueError(
                 f"DeepEP v2 combine requires bfloat16 input, "
@@ -332,26 +334,11 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             x=fused_expert_output,
             handle=handle,
             topk_weights=None,
-            previous_event=previous_event,
-            async_with_compute_stream=do_async and not dbo_enabled(),
+            async_with_compute_stream=False,
         )
 
-        dbo_switch_to_compute()
-
-        if do_async:
-
-            def _receiver():
-                if event.event is not None:
-                    event.current_stream_wait()
-                dbo_switch_to_comm()
-                output.copy_(combined_x, non_blocking=True)
-                dbo_yield_and_switch_from_comm_to_compute()
-
-            return _receiver
-        else:
-            assert not dbo_enabled()
-            output.copy_(combined_x, non_blocking=True)
-            return None
+        output.copy_(combined_x, non_blocking=True)
+        return None
 
     def finalize_async(
         self,
@@ -362,17 +349,16 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> Callable:
-        receiver = self._finalize(
+        self._finalize(
             output,
             fused_expert_output,
             topk_weights,
             topk_ids,
             apply_router_weight_on_input,
             weight_and_reduce_impl,
-            True,
+            False,
         )
-        assert receiver is not None
-        return receiver
+        return lambda: None
 
     def finalize(
         self,
