@@ -508,9 +508,9 @@ RUN apt-get update -y \
             echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list ; \
         fi ; \
     else \
-        for i in 1 2 3; do \
+        for i in 1 2 3 4 5 6 7 8 9 10; do \
             add-apt-repository -y ppa:deadsnakes/ppa && break || \
-            { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+            { echo "Attempt $i failed, retrying in 5s..."; sleep 10; }; \
         done ; \
     fi \
     && apt-get update -y \
