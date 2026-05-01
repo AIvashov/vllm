@@ -857,14 +857,9 @@ class DeepseekV4MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        # ``hidden_states`` is pre-norm (the previous ``ffn_norm`` step is
-        # now folded into ``norm_gate``).  Compute the normed activation
-        # and router logits in a single fused kernel where eligible; the
-        # fallback inside ``norm_gate`` handles non-fast-path cases.
-        if self.norm_gate.tid2eid is not None:
-            if input_ids is None:
-                raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
-            input_ids = input_ids.to(dtype=self.hash_indices_dtype)
+        if self.gate.tid2eid is not None and input_ids is None:
+            raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
+
         if not self.use_mega_moe:
             return self._forward_fused_moe(hidden_states, input_ids)
 
@@ -1227,7 +1222,12 @@ class DeepseekV4Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
-
+        if vllm_config.parallel_config.enable_expert_parallel:
+            self.use_mega_moe = (
+                vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+            )
+        else:
+            self.use_mega_moe = False
         self.vocab_size = config.vocab_size
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
@@ -1311,7 +1311,8 @@ class DeepseekV4Model(nn.Module):
     ) -> torch.Tensor | IntermediateTensors:
         hidden_states = self.embed_input_ids(input_ids)
         hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-
+        if self.use_mega_moe:
+            input_ids = input_ids.to(torch.int64)
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(
                 hidden_states,

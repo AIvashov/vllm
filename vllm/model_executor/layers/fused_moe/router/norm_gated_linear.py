@@ -91,7 +91,7 @@ class NormGatedLinear(nn.Module):
         self._fused_kernel_supported = (
             hidden_size == DSV4_PRO_HIDDEN_SIZE
             and num_experts == DSV4_PRO_NUM_EXPERTS
-            and self.gate.allow_dsv3_router_gemm  # this condition requires cuda platform
+            and self.gate.allow_dsv3_router_gemm  # cuda platform
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
