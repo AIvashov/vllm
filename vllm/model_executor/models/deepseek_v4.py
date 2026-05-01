@@ -28,8 +28,8 @@ from vllm.model_executor.layers.fused_moe.layer import UnquantizedFusedMoEMethod
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
-from vllm.model_executor.layers.fused_moe.router.norm_gated_linear import (
-    NormGatedLinear,
+from vllm.model_executor.layers.fused_moe.router.norm_gate_linear import (
+    NormGateLinear,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -747,7 +747,7 @@ class DeepseekV4MoE(nn.Module):
             )
 
         # Fused RMSNorm + gate: owns both ffn_norm and the gate matmul.
-        self.norm_gate = NormGatedLinear(
+        self.norm_gate = NormGateLinear(
             hidden_size=config.hidden_size,
             num_experts=config.n_routed_experts,
             rms_eps=config.rms_norm_eps,
@@ -758,7 +758,6 @@ class DeepseekV4MoE(nn.Module):
         # populated below depending on the MoE variant.
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
-        self.norm_gate.tid2eid = None
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
             # Use randint instead of empty to avoid garbage values causing
