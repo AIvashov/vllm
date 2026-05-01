@@ -203,9 +203,9 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             is_padding = (row_indices >= num_real).unsqueeze(1)
 
-            expert_x.masked_fill_(is_padding, 0.0)
+            expert_x = torch.where(is_padding, torch.zeros_like(expert_x), expert_x)
             if expert_x_scale is not None:
-                expert_x_scale.masked_fill_(is_padding, 0.0)
+                expert_x_scale = torch.where(is_padding, torch.zeros_like(expert_x_scale), expert_x_scale)
             recv_topk_idx = torch.where(
                 is_padding, self.rank_expert_offset, recv_topk_idx,
             )
@@ -213,7 +213,7 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 recv_topk_idx == -1, self.rank_expert_offset, recv_topk_idx,
             )
             if recv_topk_weights is not None:
-                recv_topk_weights.masked_fill_(is_padding, 0.0)
+                recv_topk_weights = torch.where(is_padding, torch.zeros_like(recv_topk_weights), recv_topk_weights)
 
         # Reshape recv_topk_weights to match recv_topk_idx shape [N, 1]
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
