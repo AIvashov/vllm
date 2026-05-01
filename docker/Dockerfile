@@ -478,9 +478,6 @@ FROM ${FINAL_BASE_IMAGE} AS vllm-base
 
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
-ARG DEADSNAKES_MIRROR_URL
-ARG DEADSNAKES_GPGKEY_URL
-ARG GET_PIP_URL
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
@@ -490,30 +487,34 @@ WORKDIR /vllm-workspace
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
-# Install Python and system dependencies
+# Install Python (via uv / python-build-standalone) and system dependencies.
+# This replaces the deadsnakes PPA, removing the build-time dependency on
+# Launchpad and matching how the build-stage (`base`) installs Python.
+# python-build-standalone bundles dev headers, the venv module, and
+# python3-config, so the python3.X-dev / python3.X-venv apt packages
+# are not needed.
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        software-properties-common \
         curl \
         sudo \
         ffmpeg \
         libsm6 \
         libxext6 \
         libgl1 \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv \
         libibverbs-dev \
     && rm -rf /var/lib/apt/lists/* \
     && curl -LsSf https://astral.sh/uv/install.sh | sh \
     && $HOME/.local/bin/uv venv /opt/venv --python ${PYTHON_VERSION} \
     && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
     && ln -s /opt/venv/bin/python3 /usr/bin/python3 \
+    && ln -s /opt/venv/bin/python${PYTHON_VERSION} /usr/bin/python${PYTHON_VERSION} \
     && ln -s /opt/venv/bin/python3-config /usr/bin/python3-config \
     && ln -s /opt/venv/bin/pip /usr/bin/pip \
     && python3 --version && python3 -m pip --version
+
+# Activate virtual environment and add uv to PATH
+ENV PATH="/opt/venv/bin:/root/.local/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
 
 # Install CUDA development tools for runtime JIT compilation
 # (FlashInfer, DeepGEMM, EP kernels all require compilation at runtime)
@@ -538,9 +539,6 @@ RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
     NCCL_VER=$(apt-cache madison libnccl-dev | grep "+cuda${CUDA_VERSION_SHORT}" | head -1 | awk -F'|' '{gsub(/^ +| +$/, "", $2); print $2}') && \
     apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev=${NCCL_VER} libnccl2=${NCCL_VER} && \
     rm -rf /var/lib/apt/lists/*
-
-# Install uv for faster pip installs
-RUN python3 -m pip install uv
 
 # Environment for uv
 ENV UV_HTTP_TIMEOUT=500
@@ -731,7 +729,7 @@ ENV HF_XET_HIGH_PERFORMANCE 1
 ENV HF_HUB_DOWNLOAD_TIMEOUT 60
 
 # Copy in the v1 package for testing (it isn't distributed yet)
-COPY vllm/v1 /usr/local/lib/python${PYTHON_VERSION}/dist-packages/vllm/v1
+COPY vllm/v1 /opt/venv/lib/python${PYTHON_VERSION}/site-packages/vllm/v1
 
 # Source code is used in the `python_only_compile.sh` test
 # We hide it inside `src/` so that this source code
