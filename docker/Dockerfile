@@ -478,9 +478,6 @@ FROM ${FINAL_BASE_IMAGE} AS vllm-base
 
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
-ARG DEADSNAKES_MIRROR_URL
-ARG DEADSNAKES_GPGKEY_URL
-ARG GET_PIP_URL
 
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /vllm-workspace
@@ -490,42 +487,31 @@ WORKDIR /vllm-workspace
 RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
     echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
 
-# Install Python and system dependencies
+# Install system dependencies and Python via uv-managed standalone build.
+# This avoids the deadsnakes PPA / Launchpad, which is not always reachable
+# from CI build agents on Ubuntu 22.04 base images. Ubuntu 24.04 base images
+# could use distro python3.12 directly, but using uv keeps both paths uniform.
 RUN apt-get update -y \
     && apt-get install -y --no-install-recommends \
-        software-properties-common \
         curl \
         sudo \
         ffmpeg \
         libsm6 \
         libxext6 \
         libgl1 \
-    && if [ ! -z ${DEADSNAKES_MIRROR_URL} ] ; then \
-        if [ ! -z "${DEADSNAKES_GPGKEY_URL}" ] ; then \
-            mkdir -p -m 0755 /etc/apt/keyrings ; \
-            curl -L ${DEADSNAKES_GPGKEY_URL} | gpg --dearmor > /etc/apt/keyrings/deadsnakes.gpg ; \
-            sudo chmod 644 /etc/apt/keyrings/deadsnakes.gpg ; \
-            echo "deb [signed-by=/etc/apt/keyrings/deadsnakes.gpg] ${DEADSNAKES_MIRROR_URL} $(lsb_release -cs) main" > /etc/apt/sources.list.d/deadsnakes.list ; \
-        fi ; \
-    else \
-        for i in 1 2 3; do \
-            add-apt-repository -y ppa:deadsnakes/ppa && break || \
-            { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
-        done ; \
-    fi \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv \
         libibverbs-dev \
     && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
-    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
-    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
-    && rm -f /usr/lib/python${PYTHON_VERSION}/EXTERNALLY-MANAGED \
-    && curl -sS ${GET_PIP_URL} | python${PYTHON_VERSION} \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && $HOME/.local/bin/uv venv /opt/venv --python ${PYTHON_VERSION} \
+    && rm -f /usr/bin/python3 /usr/bin/python3-config /usr/bin/pip \
+    && ln -s /opt/venv/bin/python3 /usr/bin/python3 \
+    && ln -s /opt/venv/bin/python3-config /usr/bin/python3-config \
+    && ln -s /opt/venv/bin/pip /usr/bin/pip \
     && python3 --version && python3 -m pip --version
+
+# Activate venv: ensures `uv`, `pip`, `python` resolve to the /opt/venv install
+ENV PATH="/opt/venv/bin:/root/.local/bin:$PATH"
+ENV VIRTUAL_ENV="/opt/venv"
 
 # Install CUDA development tools for runtime JIT compilation
 # (FlashInfer, DeepGEMM, EP kernels all require compilation at runtime)
