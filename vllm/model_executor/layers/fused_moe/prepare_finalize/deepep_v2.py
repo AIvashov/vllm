@@ -22,14 +22,32 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
     Prepare/Finalize using DeepEP v2 ElasticBuffer (unified API).
 
-    Uses do_expand=True so dispatch produces per-expert-contiguous layout:
-    each (token, expert) pair gets its own row, with expert regions contiguous.
-    Combine handles weighted reduction internally.
+    Uses do_expand=False so dispatch returns tokens in their original order
+    with recv_topk_idx containing global expert IDs. The expert kernel
+    (e.g. DeepGemm, Triton) handles sorting/grouping by expert internally.
 
-    Uses synchronous dispatch/combine (async_with_compute_stream=False).
-    The ElasticBuffer still runs comm kernels on its internal comm_stream;
-    setting async=False just means the caller's stream waits for completion.
-    This is cudagraph-compatible and DBO-compatible.
+    Key design decisions for cudagraph + DBO compatibility:
+
+    1. do_expand=False (not True): do_expand=True requires either
+       do_cpu_sync=True (CPU polling loop, uncapturable) or cached handles
+       (which explicitly reject do_expand=True in DeepEP C++ assertions).
+       do_expand=False avoids both issues.
+
+    2. do_cpu_sync=False: Avoids the CPU polling loop that would block
+       cudagraph capture. Tensors are worst-case allocated; padding rows
+       beyond the real token count are zeroed out using
+       handle.psum_num_recv_tokens_per_scaleup_rank[-1].
+
+    3. async_with_compute_stream=False: Synchronous from the caller's
+       perspective. The ElasticBuffer still runs comm kernels on its
+       internal comm_stream, but the caller's stream waits for completion.
+       This avoids the two-stream DBO switching (dbo_yield_and_switch_*)
+       that was copied from deepep_ht.py and is incompatible with
+       cudagraph capture.
+
+    4. expert_tokens_meta=None: Since do_expand=False returns unsorted
+       tokens, we don't provide pre-computed per-expert metadata. The
+       expert kernel sorts internally (same as the standard non-EP path).
     """
 
     @staticmethod
