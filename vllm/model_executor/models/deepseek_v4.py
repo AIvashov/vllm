@@ -758,7 +758,7 @@ class DeepseekV4MoE(nn.Module):
         # populated below depending on the MoE variant.
         is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
-
+        self.norm_gate.tid2eid = None
         if is_hash_moe:
             # hash MoE doesn't use e_score_correction_bias
             # Use randint instead of empty to avoid garbage values causing
@@ -857,7 +857,7 @@ class DeepseekV4MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if self.gate.tid2eid is not None and input_ids is None:
+        if self.norm_gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         if not self.use_mega_moe:
