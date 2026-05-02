@@ -209,25 +209,24 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 expert_x_scale = torch.where(
                     is_padding, torch.ones_like(expert_x_scale),
                     expert_x_scale)
-            recv_topk_idx = torch.where(is_padding, 0, recv_topk_idx)
             if recv_topk_weights is not None:
                 recv_topk_weights = torch.where(
                     is_padding, torch.zeros_like(recv_topk_weights),
                     recv_topk_weights)
 
             # dispatch(do_expand=False) returns LOCAL expert IDs (-1 for
-            # non-local). Convert to global IDs for the expert kernel
-            # (which uses expert_map). Replace -1 with rank_expert_offset
-            # (safe dummy) and zero the weight.
-            is_nonlocal = recv_topk_idx < 0
+            # non-local, -1 for padding after the where above).
+            # Convert valid local IDs to global. Keep -1 as -1 so
+            # DeepGemm's is_computation_valid skips those rows.
+            is_invalid = (recv_topk_idx < 0) | is_padding
             recv_topk_idx = torch.where(
-                is_nonlocal,
-                self.rank_expert_offset,
+                is_invalid,
+                -1,
                 recv_topk_idx + self.rank_expert_offset,
             )
             if recv_topk_weights is not None:
                 recv_topk_weights = torch.where(
-                    is_nonlocal,
+                    is_invalid,
                     torch.zeros_like(recv_topk_weights),
                     recv_topk_weights,
                 )
