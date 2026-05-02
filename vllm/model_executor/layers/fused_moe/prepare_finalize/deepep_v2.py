@@ -194,8 +194,8 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             recv_topk_idx = recv_topk_idx.unsqueeze(1)
         else:
             # do_expand=False (decode/cudagraph mode): recv_topk_idx has
-            # global expert IDs. Sanitize padding rows from worst-case
-            # allocation (do_cpu_sync=False).
+            # LOCAL expert IDs (-1 for non-local). Sanitize padding rows
+            # from worst-case allocation, then convert to global IDs.
             total_rows = expert_x.shape[0]
             num_real = psum_recv_per_rank[-1]  # GPU scalar tensor
             row_indices = torch.arange(
@@ -203,17 +203,34 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             is_padding = (row_indices >= num_real).unsqueeze(1)
 
-            expert_x = torch.where(is_padding, torch.zeros_like(expert_x), expert_x)
+            expert_x = torch.where(
+                is_padding, torch.zeros_like(expert_x), expert_x)
             if expert_x_scale is not None:
-                expert_x_scale = torch.where(is_padding, torch.zeros_like(expert_x_scale), expert_x_scale)
+                expert_x_scale = torch.where(
+                    is_padding, torch.ones_like(expert_x_scale),
+                    expert_x_scale)
+            recv_topk_idx = torch.where(is_padding, 0, recv_topk_idx)
+            if recv_topk_weights is not None:
+                recv_topk_weights = torch.where(
+                    is_padding, torch.zeros_like(recv_topk_weights),
+                    recv_topk_weights)
+
+            # dispatch(do_expand=False) returns LOCAL expert IDs (-1 for
+            # non-local). Convert to global IDs for the expert kernel
+            # (which uses expert_map). Replace -1 with rank_expert_offset
+            # (safe dummy) and zero the weight.
+            is_nonlocal = recv_topk_idx < 0
             recv_topk_idx = torch.where(
-                is_padding, self.rank_expert_offset, recv_topk_idx,
-            )
-            recv_topk_idx = torch.where(
-                recv_topk_idx == -1, self.rank_expert_offset, recv_topk_idx,
+                is_nonlocal,
+                self.rank_expert_offset,
+                recv_topk_idx + self.rank_expert_offset,
             )
             if recv_topk_weights is not None:
-                recv_topk_weights = torch.where(is_padding, torch.zeros_like(recv_topk_weights), recv_topk_weights)
+                recv_topk_weights = torch.where(
+                    is_nonlocal,
+                    torch.zeros_like(recv_topk_weights),
+                    recv_topk_weights,
+                )
 
         # Reshape recv_topk_weights to match recv_topk_idx shape [N, 1]
         if recv_topk_weights is not None and recv_topk_weights.ndim == 1:
