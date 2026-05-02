@@ -514,9 +514,8 @@ RUN apt-get update -y \
         tk-dev \
     && PYTHON_MAJOR_MINOR=${PYTHON_VERSION} \
     && PYTHON_FULL_VERSION=$(curl -s https://www.python.org/ftp/python/ \
-        | grep -oP "href=\"${PYTHON_MAJOR_MINOR}\.[0-9]+/\"" \
-        | sed 's/href="//;s/\///' \
-        | sort -t. -k3 -n \
+        | grep -oE "${PYTHON_MAJOR_MINOR}\.[0-9]+" \
+        | sort -t. -k3 -n | uniq \
         | tail -1) \
     && echo "Building Python ${PYTHON_FULL_VERSION} from source..." \
     && curl -fSL https://www.python.org/ftp/python/${PYTHON_FULL_VERSION}/Python-${PYTHON_FULL_VERSION}.tgz -o /tmp/python.tgz \
