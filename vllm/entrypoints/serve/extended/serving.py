@@ -5,8 +5,6 @@ import asyncio
 import time
 from http import HTTPStatus
 
-import torch
-
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -27,37 +25,6 @@ from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
 
-class _TargetTokenLogprobsProcessor:
-    """
-    Teacher-forcing LogitsProcessor for target-token-only scoring.
-
-    At each decode step it:
-      1. Records log P(target | context) = logit[target] - logsumexp(logits),
-         computed from the *original* logits — O(vocab_size), not O(seq * vocab).
-      2. Forces the sampler to emit the target token so the next step is
-         conditioned on the correct context (teacher forcing).
-
-    Because only the prefix is submitted as the vLLM prompt, the KV cache is
-    naturally bounded to prefix_len and never reaches into the scored suffix.
-    """
-
-    def __init__(self, target_ids: list[int]) -> None:
-        self._targets = target_ids
-        self._step = 0
-        self.logprobs: list[float] = []
-
-    def __call__(self, token_ids: list[int], logits: torch.Tensor) -> torch.Tensor:
-        if self._step >= len(self._targets):
-            return logits
-        target = self._targets[self._step]
-        self._step += 1
-        # Compute from the original distribution before any modification.
-        log_prob = float(logits[target]) - float(torch.logsumexp(logits, dim=-1))
-        self.logprobs.append(log_prob)
-        # Force the sampler to emit the target token.
-        forced = torch.full_like(logits, float("-inf"))
-        forced[target] = logits[target]
-        return forced
 
 
 def _is_engine_fatal(exc: BaseException) -> bool:
@@ -166,49 +133,83 @@ class ExtendedServing(OpenAIServing):
         aggregation: str,
     ) -> tuple[int, float, int | None]:
         """
-        Score a candidate using teacher-forced decoding over the suffix.
+        Score a candidate by submitting one request per suffix token, all in parallel.
 
-        Only the prefix is submitted as the vLLM prompt, so the KV cache is
-        naturally bounded to prefix_len and never reaches the scored suffix.
-        Memory cost is O(vocab_size) per suffix token instead of
-        O(full_seq_len * vocab_size) that prompt_logprobs would require.
+        Request k probes P(suffix[k] | token_ids[:prefix_len+k]) using
+        SamplingParams.logprob_token_ids, which uses torch.gather instead of
+        materialising the full [seq_len × vocab] log_softmax.  The KV cache is
+        naturally bounded to each request's own prompt length.
         """
         suffix = token_ids[prefix_len:]
         if not suffix:
             raise ValueError(f"Candidate {idx}: no suffix tokens to score (prefix_len={prefix_len})")
 
-        request_id = f"ppl-{request_base_id}-{idx}"
-        collector = _TargetTokenLogprobsProcessor(suffix)
+        step_results = await asyncio.gather(
+            *[
+                self._get_token_logprob(
+                    prompt_tokens=token_ids[: prefix_len + k],
+                    target_token_id=suffix[k],
+                    request_id=f"ppl-{request_base_id}-{idx}-{k}",
+                )
+                for k in range(len(suffix))
+            ],
+            return_exceptions=True,
+        )
 
+        chunk_logprobs: list[float] = []
+        for k, result in enumerate(step_results):
+            if isinstance(result, BaseException):
+                raise RuntimeError(f"Candidate {idx} step {k} failed: {result}") from result
+            logprob, _ = result
+            chunk_logprobs.append(logprob)
+
+        if len(chunk_logprobs) != len(suffix):
+            raise RuntimeError(
+                f"Candidate {idx}: got {len(chunk_logprobs)} logprobs, expected {len(suffix)}"
+            )
+
+        score = (
+            sum(chunk_logprobs) / len(chunk_logprobs)
+            if aggregation == "mean"
+            else sum(chunk_logprobs)
+        )
+        # Report cached_tokens from step 0 as a proxy for prefix-cache health.
+        _, first_cached = step_results[0]
+        return idx, score, first_cached
+
+    async def _get_token_logprob(
+        self,
+        prompt_tokens: list[int],
+        target_token_id: int,
+        request_id: str,
+    ) -> tuple[float, int | None]:
+        """Return (log_prob, cached_tokens) for target_token_id given prompt_tokens."""
         sampling_params = SamplingParams(
-            max_tokens=len(suffix),
+            max_tokens=1,
             temperature=0.0,
-            logits_processors=[collector],
+            logprob_token_ids=[target_token_id],
             detokenize=False,
         )
         result_gen = self.engine_client.generate(
-            tokens_input(token_ids[:prefix_len]), sampling_params, request_id
+            tokens_input(prompt_tokens), sampling_params, request_id
         )
-
         final_res = None
         async for res in result_gen:
             final_res = res
 
         if final_res is None or not final_res.outputs:
-            raise RuntimeError(f"Engine returned no output for candidate {idx}")
+            raise RuntimeError(f"Engine returned no output for {request_id}")
 
-        if len(collector.logprobs) != len(suffix):
+        output = final_res.outputs[0]
+        if not output.logprobs or not output.logprobs[0]:
+            raise RuntimeError(f"No logprobs in output for {request_id}")
+
+        lp = output.logprobs[0].get(target_token_id)
+        if lp is None:
             raise RuntimeError(
-                f"Candidate {idx}: collected {len(collector.logprobs)} logprobs, "
-                f"expected {len(suffix)} (prefix_len={prefix_len})"
+                f"Target token {target_token_id} missing from logprobs for {request_id}"
             )
-
-        score = (
-            sum(collector.logprobs) / len(collector.logprobs)
-            if aggregation == "mean"
-            else sum(collector.logprobs)
-        )
-        return idx, score, final_res.num_cached_tokens
+        return lp.logprob, final_res.num_cached_tokens
 
     # ------------------------------------------------------------------
     # AB Pairwise
