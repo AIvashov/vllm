@@ -16,8 +16,8 @@ class PerplexityRequest(OpenAIBaseModel):
 
 
 class PerplexityResponse(OpenAIBaseModel):
-    # Log-likelihood scores (higher = better). One entry per candidate.
-    scores: list[float]
+    # Log-likelihood scores (higher = better). None when scoring failed for that candidate.
+    scores: list[float | None]
     best_index: int
     # KV cache hits per candidate (None if not reported by engine).
     cached_tokens: list[int | None]

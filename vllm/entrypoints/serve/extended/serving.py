@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import math
 import time
-
-import numpy as np
 
 from fastapi import Request
 
@@ -80,7 +79,7 @@ class ExtendedServing(OpenAIServing):
         )
         scoring_s = time.perf_counter() - scoring_start
 
-        scores = [_NEG_INF] * n
+        scores: list[float] = [_NEG_INF] * n
         cached_tokens: list[int | None] = [None] * n
         for item in results:
             if isinstance(item, BaseException):
@@ -90,11 +89,15 @@ class ExtendedServing(OpenAIServing):
                 scores[idx] = score
                 cached_tokens[idx] = cached
 
-        best_index = int(np.argmax(scores))
+        finite = [i for i, s in enumerate(scores) if math.isfinite(s)]
+        best_index = max(finite, key=lambda i: scores[i]) if finite else -1
+        response_scores: list[float | None] = [
+            s if math.isfinite(s) else None for s in scores
+        ]
         total_s = time.perf_counter() - total_start
 
         return PerplexityResponse(
-            scores=scores,
+            scores=response_scores,
             best_index=best_index,
             cached_tokens=cached_tokens,
             profile={
@@ -110,21 +113,14 @@ class ExtendedServing(OpenAIServing):
         request_base_id: str,
         prefix_len: int,
         aggregation: str,
+        skip_reading_prefix_cache: bool = False,
     ) -> tuple[int, float, int | None]:
         request_id = f"ppl-{request_base_id}-{idx}"
         sampling_params = SamplingParams(
             max_tokens=1,
             prompt_logprobs=1,
             detokenize=False,
-            # Override the auto-set: SamplingParams.__post_init__ would set
-            # skip_reading_prefix_cache=True when prompt_logprobs is not None,
-            # because cached positions produce uninitialized logprob tensors.
-            # It is safe to keep caching here because:
-            #   1. cache hits only reach prefix_len tokens (common prefix);
-            #   2. chunk tokens are unique per candidate — never cached;
-            #   3. our scoring loop already skips positions i < prefix_len,
-            #      so the garbage values in cached positions are never read.
-            skip_reading_prefix_cache=False,
+            skip_reading_prefix_cache=skip_reading_prefix_cache,
         )
         engine_input = tokens_input(token_ids)
         result_gen = self.engine_client.generate(engine_input, sampling_params, request_id)
@@ -139,14 +135,21 @@ class ExtendedServing(OpenAIServing):
         cached = final_res.num_cached_tokens
 
         # If the KV cache reached past prefix_len, positions prefix_len..cached-1
-        # have uninitialized logprob tensors (torch.empty) and cannot be scored.
-        if cached is not None and cached > prefix_len:
+        # have uninitialized logprob tensors (torch.empty). Retry without prefix
+        # cache so the engine recomputes those positions with real logprobs.
+        if not skip_reading_prefix_cache and cached is not None and cached > prefix_len:
             logger.warning(
-                "Candidate %d: cached_tokens=%d > prefix_len=%d — "
-                "scored chunk overlaps cached region, result is unreliable; skipping",
+                "Candidate %d: cached_tokens=%d > prefix_len=%d; retrying without prefix cache",
                 idx, cached, prefix_len,
             )
-            return idx, _NEG_INF, cached
+            return await self._score_candidate(
+                token_ids=token_ids,
+                idx=idx,
+                request_base_id=request_base_id + "-nocache",
+                prefix_len=prefix_len,
+                aggregation=aggregation,
+                skip_reading_prefix_cache=True,
+            )
 
         chunk_logprobs: list[float] = []
         for i, entry in enumerate(final_res.prompt_logprobs):
