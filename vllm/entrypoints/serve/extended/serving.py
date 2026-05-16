@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import math
 import time
 from http import HTTPStatus
+
+import torch
 
 from fastapi import Request
 
@@ -26,11 +27,37 @@ from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
 
-_NEG_INF = float("-inf")
+class _TargetTokenLogprobsProcessor:
+    """
+    Teacher-forcing LogitsProcessor for target-token-only scoring.
 
+    At each decode step it:
+      1. Records log P(target | context) = logit[target] - logsumexp(logits),
+         computed from the *original* logits — O(vocab_size), not O(seq * vocab).
+      2. Forces the sampler to emit the target token so the next step is
+         conditioned on the correct context (teacher forcing).
 
-class _CacheOverlapRetry(Exception):
-    """Raised when a scoring run hit cache past prefix_len; must retry without prefix cache."""
+    Because only the prefix is submitted as the vLLM prompt, the KV cache is
+    naturally bounded to prefix_len and never reaches into the scored suffix.
+    """
+
+    def __init__(self, target_ids: list[int]) -> None:
+        self._targets = target_ids
+        self._step = 0
+        self.logprobs: list[float] = []
+
+    def __call__(self, token_ids: list[int], logits: torch.Tensor) -> torch.Tensor:
+        if self._step >= len(self._targets):
+            return logits
+        target = self._targets[self._step]
+        self._step += 1
+        # Compute from the original distribution before any modification.
+        log_prob = float(logits[target]) - float(torch.logsumexp(logits, dim=-1))
+        self.logprobs.append(log_prob)
+        # Force the sampler to emit the target token.
+        forced = torch.full_like(logits, float("-inf"))
+        forced[target] = logits[target]
+        return forced
 
 
 def _is_engine_fatal(exc: BaseException) -> bool:
@@ -68,6 +95,12 @@ class ExtendedServing(OpenAIServing):
         if error is not None:
             return error
 
+        if request.prefix_len < 1:
+            return self.create_error_response(
+                "prefix_len must be >= 1 (the prompt submitted to the engine must be non-empty)",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+
         n = len(request.candidates_tokens)
         if n == 0:
             return PerplexityResponse(scores=[], best_index=-1, cached_tokens=[])
@@ -75,13 +108,10 @@ class ExtendedServing(OpenAIServing):
             return PerplexityResponse(scores=[1.0], best_index=0, cached_tokens=[None])
 
         total_start = time.perf_counter()
-
         base_id = self._base_request_id(raw_request)
 
         scoring_start = time.perf_counter()
-
-        # Phase 1: all candidates in parallel with prefix cache enabled.
-        phase1 = await asyncio.gather(
+        results = await asyncio.gather(
             *[
                 self._score_candidate(
                     token_ids=tokens,
@@ -94,53 +124,31 @@ class ExtendedServing(OpenAIServing):
             ],
             return_exceptions=True,
         )
-
-        # Phase 2: sequentially retry candidates whose cache overshot prefix_len.
-        # Sequential to avoid concurrent OOM from large prompt_logprobs tensors.
-        results: list = list(phase1)
-        for i, result in enumerate(results):
-            if not isinstance(result, _CacheOverlapRetry):
-                continue
-            logger.info("Retrying candidate %d without prefix cache (sequential)", i)
-            try:
-                results[i] = await self._score_candidate(
-                    token_ids=request.candidates_tokens[i],
-                    idx=i,
-                    request_base_id=base_id + "-nocache",
-                    prefix_len=request.prefix_len,
-                    aggregation=request.aggregation,
-                    skip_reading_prefix_cache=True,
-                )
-            except Exception as exc:
-                results[i] = exc
-
         scoring_s = time.perf_counter() - scoring_start
 
-        scores: list[float] = [_NEG_INF] * n
-        cached_tokens: list[int | None] = [None] * n
-        for item in results:
+        scores: list[float] = []
+        cached_tokens: list[int | None] = []
+        for i, item in enumerate(results):
             if isinstance(item, BaseException):
-                if _is_engine_fatal(item):
-                    return self.create_error_response(
-                        f"Engine failure during perplexity scoring: {item}",
-                        err_type="InternalError",
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                    )
-                logger.warning("Perplexity candidate scoring failed: %s", item)
-            else:
-                idx, score, cached = item
-                scores[idx] = score
-                cached_tokens[idx] = cached
+                status = (
+                    HTTPStatus.INTERNAL_SERVER_ERROR
+                    if _is_engine_fatal(item)
+                    else HTTPStatus.UNPROCESSABLE_ENTITY
+                )
+                return self.create_error_response(
+                    f"Candidate {i} scoring failed: {item}",
+                    err_type="InternalError",
+                    status_code=status,
+                )
+            _, score, cached = item
+            scores.append(score)
+            cached_tokens.append(cached)
 
-        finite = [i for i, s in enumerate(scores) if math.isfinite(s)]
-        best_index = max(finite, key=lambda i: scores[i]) if finite else -1
-        response_scores: list[float | None] = [
-            s if math.isfinite(s) else None for s in scores
-        ]
+        best_index = max(range(n), key=lambda i: scores[i])
         total_s = time.perf_counter() - total_start
 
         return PerplexityResponse(
-            scores=response_scores,
+            scores=scores,
             best_index=best_index,
             cached_tokens=cached_tokens,
             profile={
@@ -156,63 +164,51 @@ class ExtendedServing(OpenAIServing):
         request_base_id: str,
         prefix_len: int,
         aggregation: str,
-        skip_reading_prefix_cache: bool = False,
     ) -> tuple[int, float, int | None]:
+        """
+        Score a candidate using teacher-forced decoding over the suffix.
+
+        Only the prefix is submitted as the vLLM prompt, so the KV cache is
+        naturally bounded to prefix_len and never reaches the scored suffix.
+        Memory cost is O(vocab_size) per suffix token instead of
+        O(full_seq_len * vocab_size) that prompt_logprobs would require.
+        """
+        suffix = token_ids[prefix_len:]
+        if not suffix:
+            raise ValueError(f"Candidate {idx}: no suffix tokens to score (prefix_len={prefix_len})")
+
         request_id = f"ppl-{request_base_id}-{idx}"
+        collector = _TargetTokenLogprobsProcessor(suffix)
+
         sampling_params = SamplingParams(
-            max_tokens=1,
-            prompt_logprobs=1,
+            max_tokens=len(suffix),
+            temperature=0.0,
+            logits_processors=[collector],
             detokenize=False,
-            skip_reading_prefix_cache=skip_reading_prefix_cache,
         )
-        engine_input = tokens_input(token_ids)
-        result_gen = self.engine_client.generate(engine_input, sampling_params, request_id)
+        result_gen = self.engine_client.generate(
+            tokens_input(token_ids[:prefix_len]), sampling_params, request_id
+        )
 
         final_res = None
         async for res in result_gen:
             final_res = res
 
-        if final_res is None or final_res.prompt_logprobs is None:
-            return idx, _NEG_INF, None
+        if final_res is None or not final_res.outputs:
+            raise RuntimeError(f"Engine returned no output for candidate {idx}")
 
-        cached = final_res.num_cached_tokens
-
-        # If the KV cache reached past prefix_len, positions prefix_len..cached-1
-        # have uninitialized logprob tensors (torch.empty). Signal the caller to
-        # retry sequentially with skip_reading_prefix_cache=True.
-        if not skip_reading_prefix_cache and cached is not None and cached > prefix_len:
-            logger.warning(
-                "Candidate %d: cached_tokens=%d > prefix_len=%d; will retry sequentially without prefix cache",
-                idx, cached, prefix_len,
+        if len(collector.logprobs) != len(suffix):
+            raise RuntimeError(
+                f"Candidate {idx}: collected {len(collector.logprobs)} logprobs, "
+                f"expected {len(suffix)} (prefix_len={prefix_len})"
             )
-            raise _CacheOverlapRetry()
-
-        chunk_logprobs: list[float] = []
-        for i, entry in enumerate(final_res.prompt_logprobs):
-            if i < prefix_len or entry is None:
-                continue
-            # Look up the actual prompt token, not rank-1 (top-1 by probability).
-            lp = entry.get(token_ids[i])
-            if lp is not None:
-                chunk_logprobs.append(lp.logprob)
-
-        expected_scored = len(token_ids) - prefix_len
-        if len(chunk_logprobs) != expected_scored:
-            logger.warning(
-                "Candidate %d: scored %d tokens, expected %d (prefix_len=%d, total=%d); treating as failure",
-                idx, len(chunk_logprobs), expected_scored, prefix_len, len(token_ids),
-            )
-            return idx, _NEG_INF, cached
-
-        if not chunk_logprobs:
-            return idx, _NEG_INF, cached
 
         score = (
-            sum(chunk_logprobs) / len(chunk_logprobs)
+            sum(collector.logprobs) / len(collector.logprobs)
             if aggregation == "mean"
-            else sum(chunk_logprobs)
+            else sum(collector.logprobs)
         )
-        return idx, score, cached
+        return idx, score, final_res.num_cached_tokens
 
     # ------------------------------------------------------------------
     # AB Pairwise
