@@ -4,6 +4,7 @@
 import asyncio
 import math
 import time
+from http import HTTPStatus
 
 from fastapi import Request
 
@@ -26,6 +27,18 @@ from vllm.sampling_params import SamplingParams
 logger = init_logger(__name__)
 
 _NEG_INF = float("-inf")
+
+
+class _CacheOverlapRetry(Exception):
+    """Raised when a scoring run hit cache past prefix_len; must retry without prefix cache."""
+
+
+def _is_engine_fatal(exc: BaseException) -> bool:
+    etype = type(exc).__name__
+    if etype in ("EngineDeadError", "AsyncEngineDeadError", "OutOfMemoryError"):
+        return True
+    msg = str(exc).lower()
+    return "engine is dead" in msg or "out of memory" in msg
 
 
 class ExtendedServing(OpenAIServing):
@@ -63,13 +76,17 @@ class ExtendedServing(OpenAIServing):
 
         total_start = time.perf_counter()
 
+        base_id = self._base_request_id(raw_request)
+
         scoring_start = time.perf_counter()
-        results = await asyncio.gather(
+
+        # Phase 1: all candidates in parallel with prefix cache enabled.
+        phase1 = await asyncio.gather(
             *[
                 self._score_candidate(
                     token_ids=tokens,
                     idx=i,
-                    request_base_id=self._base_request_id(raw_request),
+                    request_base_id=base_id,
                     prefix_len=request.prefix_len,
                     aggregation=request.aggregation,
                 )
@@ -77,12 +94,38 @@ class ExtendedServing(OpenAIServing):
             ],
             return_exceptions=True,
         )
+
+        # Phase 2: sequentially retry candidates whose cache overshot prefix_len.
+        # Sequential to avoid concurrent OOM from large prompt_logprobs tensors.
+        results: list = list(phase1)
+        for i, result in enumerate(results):
+            if not isinstance(result, _CacheOverlapRetry):
+                continue
+            logger.info("Retrying candidate %d without prefix cache (sequential)", i)
+            try:
+                results[i] = await self._score_candidate(
+                    token_ids=request.candidates_tokens[i],
+                    idx=i,
+                    request_base_id=base_id + "-nocache",
+                    prefix_len=request.prefix_len,
+                    aggregation=request.aggregation,
+                    skip_reading_prefix_cache=True,
+                )
+            except Exception as exc:
+                results[i] = exc
+
         scoring_s = time.perf_counter() - scoring_start
 
         scores: list[float] = [_NEG_INF] * n
         cached_tokens: list[int | None] = [None] * n
         for item in results:
             if isinstance(item, BaseException):
+                if _is_engine_fatal(item):
+                    return self.create_error_response(
+                        f"Engine failure during perplexity scoring: {item}",
+                        err_type="InternalError",
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 logger.warning("Perplexity candidate scoring failed: %s", item)
             else:
                 idx, score, cached = item
@@ -135,21 +178,14 @@ class ExtendedServing(OpenAIServing):
         cached = final_res.num_cached_tokens
 
         # If the KV cache reached past prefix_len, positions prefix_len..cached-1
-        # have uninitialized logprob tensors (torch.empty). Retry without prefix
-        # cache so the engine recomputes those positions with real logprobs.
+        # have uninitialized logprob tensors (torch.empty). Signal the caller to
+        # retry sequentially with skip_reading_prefix_cache=True.
         if not skip_reading_prefix_cache and cached is not None and cached > prefix_len:
             logger.warning(
-                "Candidate %d: cached_tokens=%d > prefix_len=%d; retrying without prefix cache",
+                "Candidate %d: cached_tokens=%d > prefix_len=%d; will retry sequentially without prefix cache",
                 idx, cached, prefix_len,
             )
-            return await self._score_candidate(
-                token_ids=token_ids,
-                idx=idx,
-                request_base_id=request_base_id + "-nocache",
-                prefix_len=prefix_len,
-                aggregation=aggregation,
-                skip_reading_prefix_cache=True,
-            )
+            raise _CacheOverlapRetry()
 
         chunk_logprobs: list[float] = []
         for i, entry in enumerate(final_res.prompt_logprobs):
@@ -159,6 +195,14 @@ class ExtendedServing(OpenAIServing):
             lp = entry.get(token_ids[i])
             if lp is not None:
                 chunk_logprobs.append(lp.logprob)
+
+        expected_scored = len(token_ids) - prefix_len
+        if len(chunk_logprobs) != expected_scored:
+            logger.warning(
+                "Candidate %d: scored %d tokens, expected %d (prefix_len=%d, total=%d); treating as failure",
+                idx, len(chunk_logprobs), expected_scored, prefix_len, len(token_ids),
+            )
+            return idx, _NEG_INF, cached
 
         if not chunk_logprobs:
             return idx, _NEG_INF, cached
