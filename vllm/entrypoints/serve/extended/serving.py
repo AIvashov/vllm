@@ -138,15 +138,24 @@ class ExtendedServing(OpenAIServing):
 
         cached = final_res.num_cached_tokens
 
+        # If the KV cache reached past prefix_len, positions prefix_len..cached-1
+        # have uninitialized logprob tensors (torch.empty) and cannot be scored.
+        if cached is not None and cached > prefix_len:
+            logger.warning(
+                "Candidate %d: cached_tokens=%d > prefix_len=%d — "
+                "scored chunk overlaps cached region, result is unreliable; skipping",
+                idx, cached, prefix_len,
+            )
+            return idx, _NEG_INF, cached
+
         chunk_logprobs: list[float] = []
         for i, entry in enumerate(final_res.prompt_logprobs):
             if i < prefix_len or entry is None:
                 continue
-            # rank=1 is the actual token — its logprob is what we want.
-            for lp in entry.values():
-                if getattr(lp, "rank", None) == 1:
-                    chunk_logprobs.append(lp.logprob)
-                    break
+            # Look up the actual prompt token, not rank-1 (top-1 by probability).
+            lp = entry.get(token_ids[i])
+            if lp is not None:
+                chunk_logprobs.append(lp.logprob)
 
         if not chunk_logprobs:
             return idx, _NEG_INF, cached
