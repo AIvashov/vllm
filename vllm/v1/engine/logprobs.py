@@ -137,35 +137,30 @@ class LogprobsProcessor:
         token_ids, logprobs, ranks, _ = prompt_logprobs_tensors
 
         # Recover shapes.
-        num_prompt_tokens, num_logprobs = logprobs.shape
-
-        # Detokenize non-incrementally.
-        # Output is flat: [num_tok, num_lps] -> [num_tok * num_lps]
-        all_decoded_tokens: list[str] | None = (
-            None
-            if self.tokenizer is None
-            else convert_ids_list_to_tokens(
-                self.tokenizer, token_ids.flatten().tolist()
-            )
-        )
+        num_prompt_tokens = logprobs.shape[0]
+        missing_prompt_logprobs = (token_ids == -1).all(dim=1)
+        safe_token_ids = token_ids.clamp(min=0)
 
         # Pythonize the torch tensors.
         prompt_token_ranks = ranks.tolist()
         prompt_logprobs = logprobs.tolist()
-        token_ids_list = token_ids.tolist()
+        token_ids_list = safe_token_ids.tolist()
+        missing_prompt_logprobs_list = missing_prompt_logprobs.tolist()
 
         # Make Logprob for each position.
         for pos in range(num_prompt_tokens):
-            # Handle flattening and UTF-8 correction per position
-            offset = pos * num_logprobs
-            offset_end = offset + num_logprobs
+            if missing_prompt_logprobs_list[pos]:
+                self.prompt_logprobs.append(None)
+                continue
 
             decoded_tokens_for_pos: list[str] | Iterable[None]
-            if all_decoded_tokens is None:
+            if self.tokenizer is None:
                 decoded_tokens_for_pos = NONES
             else:
-                # Extract decoded tokens for this position
-                decoded_tokens_slice = all_decoded_tokens[offset:offset_end]
+                # Detokenize and apply UTF-8 correction per position.
+                decoded_tokens_slice = convert_ids_list_to_tokens(
+                    self.tokenizer, token_ids_list[pos]
+                )
                 # Context: preceding prompt tokens accumulated in
                 # self.prompt_logprobs from previous loop iterations.
                 context_token_ids = self._get_sampled_context_ids(self.prompt_logprobs)
