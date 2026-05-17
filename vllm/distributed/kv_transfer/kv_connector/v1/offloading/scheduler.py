@@ -478,7 +478,11 @@ class OffloadingConnectorScheduler:
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
 
-        num_hit_tokens = self._lookup(req_status)
+        # Keep the request registered for later store bookkeeping, but do not
+        # load externally cached KV blocks when the request explicitly disables
+        # prefix-cache reads. Prompt-logprob scoring needs logits for every
+        # prompt suffix position, including positions that may exist in CPU KV.
+        num_hit_tokens = 0 if request.skip_reading_prefix_cache else self._lookup(req_status)
         if is_new_request:
             req_status.update_num_hit_blocks(
                 num_computed_tokens + (num_hit_tokens or 0)
