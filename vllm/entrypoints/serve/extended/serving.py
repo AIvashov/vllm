@@ -194,19 +194,44 @@ class ExtendedServing(OpenAIServing):
             raise _CacheOverlapRetry()
 
         chunk_logprobs: list[float] = []
+        missing_suffix_positions: list[int] = []
         for i, entry in enumerate(final_res.prompt_logprobs):
-            if i < prefix_len or entry is None:
+            if i < prefix_len:
+                continue
+            if entry is None:
+                missing_suffix_positions.append(i - prefix_len)
                 continue
             # Look up the actual prompt token, not the top-1 by probability.
             lp = entry.get(token_ids[i])
             if lp is not None:
                 chunk_logprobs.append(lp.logprob)
+            else:
+                missing_suffix_positions.append(i - prefix_len)
 
         expected = len(token_ids) - prefix_len
         if len(chunk_logprobs) != expected:
+            missing_preview = missing_suffix_positions[:8]
+            if not skip_reading_prefix_cache:
+                logger.warning(
+                    "Candidate %d: incomplete prompt_logprobs scored=%d expected=%d "
+                    "cached_tokens=%s prefix_len=%d total_tokens=%d "
+                    "missing_count=%d missing_preview=%s; signalling sequential retry",
+                    idx,
+                    len(chunk_logprobs),
+                    expected,
+                    cached,
+                    prefix_len,
+                    len(token_ids),
+                    len(missing_suffix_positions),
+                    missing_preview,
+                )
+                raise _CacheOverlapRetry()
             raise RuntimeError(
                 f"Candidate {idx}: scored {len(chunk_logprobs)} tokens, "
-                f"expected {expected} (prefix_len={prefix_len})"
+                f"expected {expected} (prefix_len={prefix_len}, "
+                f"cached_tokens={cached}, total_tokens={len(token_ids)}, "
+                f"missing_count={len(missing_suffix_positions)}, "
+                f"missing_preview={missing_preview})"
             )
 
         score = (
