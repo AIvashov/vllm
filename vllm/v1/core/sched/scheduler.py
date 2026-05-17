@@ -576,7 +576,11 @@ class Scheduler(SchedulerInterface):
                     )
 
                     # Get externally-cached tokens if using a KVConnector.
-                    if self.connector is not None:
+                    # `skip_reading_prefix_cache` must cover both local prefix
+                    # cache and external KV connector cache. Prompt-logprob
+                    # scoring needs logits for every prompt suffix position;
+                    # loading a cached suffix would leave those logprobs absent.
+                    if self.connector is not None and not request.skip_reading_prefix_cache:
                         ext_tokens, load_kv_async = (
                             self.connector.get_num_new_matched_tokens(
                                 request, num_new_local_computed_tokens
