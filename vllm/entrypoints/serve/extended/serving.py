@@ -26,6 +26,9 @@ from vllm.sampling_params import SamplingParams
 logger = init_logger(__name__)
 
 
+class _CacheOverlapRetry(Exception):
+    """Raised when cached_tokens > prefix_len; caller must retry without prefix cache."""
+
 
 def _is_engine_fatal(exc: BaseException) -> bool:
     etype = type(exc).__name__
@@ -78,7 +81,9 @@ class ExtendedServing(OpenAIServing):
         base_id = self._base_request_id(raw_request)
 
         scoring_start = time.perf_counter()
-        results = await asyncio.gather(
+
+        # Phase 1: all candidates in parallel with prefix cache enabled.
+        phase1 = await asyncio.gather(
             *[
                 self._score_candidate(
                     token_ids=tokens,
@@ -91,6 +96,26 @@ class ExtendedServing(OpenAIServing):
             ],
             return_exceptions=True,
         )
+
+        # Phase 2: retry candidates that hit cache past prefix_len, sequentially
+        # to avoid concurrent prompt_logprobs OOM on long sequences.
+        results: list = list(phase1)
+        for i, result in enumerate(results):
+            if not isinstance(result, _CacheOverlapRetry):
+                continue
+            logger.info("Retrying candidate %d without prefix cache (sequential)", i)
+            try:
+                results[i] = await self._score_candidate(
+                    token_ids=request.candidates_tokens[i],
+                    idx=i,
+                    request_base_id=base_id + "-nocache",
+                    prefix_len=request.prefix_len,
+                    aggregation=request.aggregation,
+                    skip_reading_prefix_cache=True,
+                )
+            except Exception as exc:
+                results[i] = exc
+
         scoring_s = time.perf_counter() - scoring_start
 
         scores: list[float] = []
@@ -131,41 +156,57 @@ class ExtendedServing(OpenAIServing):
         request_base_id: str,
         prefix_len: int,
         aggregation: str,
+        skip_reading_prefix_cache: bool = False,
     ) -> tuple[int, float, int | None]:
         """
-        Score a candidate by submitting one request per suffix token, all in parallel.
+        Score a candidate with a single engine request using prompt_logprobs=1.
 
-        Request k probes P(suffix[k] | token_ids[:prefix_len+k]) using
-        SamplingParams.logprob_token_ids, which uses torch.gather instead of
-        materialising the full [seq_len × vocab] log_softmax.  The KV cache is
-        naturally bounded to each request's own prompt length.
+        One request per candidate (not per token).  If the KV cache overshot into
+        the scored suffix (cached_tokens > prefix_len), raises _CacheOverlapRetry
+        so the caller can retry sequentially with skip_reading_prefix_cache=True.
         """
-        suffix = token_ids[prefix_len:]
-        if not suffix:
-            raise ValueError(f"Candidate {idx}: no suffix tokens to score (prefix_len={prefix_len})")
-
-        step_results = await asyncio.gather(
-            *[
-                self._get_token_logprob(
-                    prompt_tokens=token_ids[: prefix_len + k],
-                    target_token_id=suffix[k],
-                    request_id=f"ppl-{request_base_id}-{idx}-{k}",
-                )
-                for k in range(len(suffix))
-            ],
-            return_exceptions=True,
+        request_id = f"ppl-{request_base_id}-{idx}"
+        sampling_params = SamplingParams(
+            max_tokens=1,
+            prompt_logprobs=1,
+            detokenize=False,
+            skip_reading_prefix_cache=skip_reading_prefix_cache,
         )
+        result_gen = self.engine_client.generate(
+            tokens_input(token_ids), sampling_params, request_id
+        )
+        final_res = None
+        async for res in result_gen:
+            final_res = res
+
+        if final_res is None or final_res.prompt_logprobs is None:
+            raise RuntimeError(f"No prompt_logprobs returned for candidate {idx}")
+
+        cached = final_res.num_cached_tokens
+
+        # If the cache overshot into the scored suffix, prompt_logprobs for
+        # positions prefix_len..cached-1 contain uninitialised tensors.
+        if not skip_reading_prefix_cache and cached is not None and cached > prefix_len:
+            logger.warning(
+                "Candidate %d: cached_tokens=%d > prefix_len=%d; signalling sequential retry",
+                idx, cached, prefix_len,
+            )
+            raise _CacheOverlapRetry()
 
         chunk_logprobs: list[float] = []
-        for k, result in enumerate(step_results):
-            if isinstance(result, BaseException):
-                raise RuntimeError(f"Candidate {idx} step {k} failed: {result}") from result
-            logprob, _ = result
-            chunk_logprobs.append(logprob)
+        for i, entry in enumerate(final_res.prompt_logprobs):
+            if i < prefix_len or entry is None:
+                continue
+            # Look up the actual prompt token, not the top-1 by probability.
+            lp = entry.get(token_ids[i])
+            if lp is not None:
+                chunk_logprobs.append(lp.logprob)
 
-        if len(chunk_logprobs) != len(suffix):
+        expected = len(token_ids) - prefix_len
+        if len(chunk_logprobs) != expected:
             raise RuntimeError(
-                f"Candidate {idx}: got {len(chunk_logprobs)} logprobs, expected {len(suffix)}"
+                f"Candidate {idx}: scored {len(chunk_logprobs)} tokens, "
+                f"expected {expected} (prefix_len={prefix_len})"
             )
 
         score = (
@@ -173,43 +214,7 @@ class ExtendedServing(OpenAIServing):
             if aggregation == "mean"
             else sum(chunk_logprobs)
         )
-        # Report cached_tokens from step 0 as a proxy for prefix-cache health.
-        _, first_cached = step_results[0]
-        return idx, score, first_cached
-
-    async def _get_token_logprob(
-        self,
-        prompt_tokens: list[int],
-        target_token_id: int,
-        request_id: str,
-    ) -> tuple[float, int | None]:
-        """Return (log_prob, cached_tokens) for target_token_id given prompt_tokens."""
-        sampling_params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            logprob_token_ids=[target_token_id],
-            detokenize=False,
-        )
-        result_gen = self.engine_client.generate(
-            tokens_input(prompt_tokens), sampling_params, request_id
-        )
-        final_res = None
-        async for res in result_gen:
-            final_res = res
-
-        if final_res is None or not final_res.outputs:
-            raise RuntimeError(f"Engine returned no output for {request_id}")
-
-        output = final_res.outputs[0]
-        if not output.logprobs or not output.logprobs[0]:
-            raise RuntimeError(f"No logprobs in output for {request_id}")
-
-        lp = output.logprobs[0].get(target_token_id)
-        if lp is None:
-            raise RuntimeError(
-                f"Target token {target_token_id} missing from logprobs for {request_id}"
-            )
-        return lp.logprob, final_res.num_cached_tokens
+        return idx, score, cached
 
     # ------------------------------------------------------------------
     # AB Pairwise
