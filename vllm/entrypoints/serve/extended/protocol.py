@@ -16,12 +16,13 @@ class PerplexityRequest(OpenAIBaseModel):
 
 
 class PerplexityResponse(OpenAIBaseModel):
-    # Log-likelihood scores (higher = better). None when scoring failed for that candidate.
+    # Log-likelihood scores (higher = better). None when scoring failed for
+    # that candidate.
     scores: list[float | None]
     best_index: int
     # KV cache hits per candidate (None if not reported by engine).
     cached_tokens: list[int | None]
-    profile: dict[str, float] = {}
+    profile: dict[str, float | int] = {}
 
 
 class ABPairwiseResult(OpenAIBaseModel):
@@ -35,7 +36,8 @@ class ABPairwiseRequest(OpenAIBaseModel):
     model: str
     # One pre-built judge prompt per pair comparison (chat template applied by caller).
     candidates_prompts: list[list[int]]
-    # Constrained decoding: only these token IDs can be sampled (shared across all prompts).
+    # Constrained decoding: only these token IDs can be sampled (shared across
+    # all prompts).
     allowed_token_ids: list[int] | None = None
     temperature: float = 0.0
     seed: int = 42042
@@ -44,4 +46,4 @@ class ABPairwiseRequest(OpenAIBaseModel):
 class ABPairwiseResponse(OpenAIBaseModel):
     # One entry per input prompt, in the same order.
     results: list[ABPairwiseResult]
-    profile: dict[str, float] = {}
+    profile: dict[str, float | int] = {}

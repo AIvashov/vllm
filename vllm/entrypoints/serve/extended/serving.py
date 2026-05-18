@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
 
 from fastapi import Request
@@ -26,16 +27,20 @@ from vllm.sampling_params import SamplingParams
 logger = init_logger(__name__)
 
 
-class _CacheOverlapRetry(Exception):
-    """Raised when cached_tokens > prefix_len; caller must retry without prefix cache."""
-
-
 def _is_engine_fatal(exc: BaseException) -> bool:
     etype = type(exc).__name__
     if etype in ("EngineDeadError", "AsyncEngineDeadError", "OutOfMemoryError"):
         return True
     msg = str(exc).lower()
     return "engine is dead" in msg or "out of memory" in msg
+
+
+@dataclass
+class _CandidateScore:
+    idx: int
+    token_logprobs: list[float | None]
+    missing_positions: list[int]
+    cached_tokens: int | None
 
 
 class ExtendedServing(OpenAIServing):
@@ -65,56 +70,98 @@ class ExtendedServing(OpenAIServing):
         if error is not None:
             return error
 
-        if request.prefix_len < 1:
+        if request.prefix_len < 0:
             return self.create_error_response(
-                "prefix_len must be >= 1 (the prompt submitted to the engine must be non-empty)",
+                "prefix_len must be >= 0",
                 status_code=HTTPStatus.BAD_REQUEST,
             )
 
         n = len(request.candidates_tokens)
         if n == 0:
             return PerplexityResponse(scores=[], best_index=-1, cached_tokens=[])
-        if n == 1:
-            return PerplexityResponse(scores=[1.0], best_index=0, cached_tokens=[None])
+
+        score_start = self._score_start(request.prefix_len)
+        for i, token_ids in enumerate(request.candidates_tokens):
+            if not token_ids:
+                return self.create_error_response(
+                    f"candidates_tokens[{i}] must be non-empty",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+            if score_start >= len(token_ids):
+                return self.create_error_response(
+                    f"candidates_tokens[{i}] has no tokens to score "
+                    f"(prefix_len={request.prefix_len}, num_tokens={len(token_ids)})",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
 
         total_start = time.perf_counter()
         base_id = self._base_request_id(raw_request)
 
         scoring_start = time.perf_counter()
+        results: list[_CandidateScore | BaseException | None] = [None] * n
+        peer_fill_positions = 0
 
-        # Phase 1: all candidates in parallel with prefix cache enabled.
-        phase1 = await asyncio.gather(
-            *[
-                self._score_candidate(
-                    token_ids=tokens,
-                    idx=i,
-                    request_base_id=base_id,
-                    prefix_len=request.prefix_len,
-                    aggregation=request.aggregation,
-                )
-                for i, tokens in enumerate(request.candidates_tokens)
-            ],
-            return_exceptions=True,
-        )
-
-        # Phase 2: retry candidates that hit cache past prefix_len, sequentially
-        # to avoid concurrent prompt_logprobs OOM on long sequences.
-        results: list = list(phase1)
-        for i, result in enumerate(results):
-            if not isinstance(result, _CacheOverlapRetry):
-                continue
-            logger.info("Retrying candidate %d without prefix cache (sequential)", i)
+        # Phase 1: score candidates in a prefix-friendly order. Lexicographic
+        # sorting keeps shared prefixes adjacent and naturally places a shorter
+        # prefix before its longer extensions, so later candidates can hit the
+        # KV-cache while we recover cached prompt_logprobs from earlier peers.
+        for i in self._prefix_cache_order(request.candidates_tokens):
             try:
                 results[i] = await self._score_candidate(
                     token_ids=request.candidates_tokens[i],
                     idx=i,
-                    request_base_id=base_id + "-nocache",
+                    request_base_id=base_id,
                     prefix_len=request.prefix_len,
-                    aggregation=request.aggregation,
-                    skip_reading_prefix_cache=True,
                 )
             except Exception as exc:
                 results[i] = exc
+            else:
+                peer_fill_positions += self._fill_missing_from_peer_candidates(
+                    results, request.candidates_tokens
+                )
+
+        # Phase 2: fill prompt_logprobs gaps created by KV-cache hits. We first
+        # reuse any logprobs available from sibling candidates with identical
+        # token prefixes. Then we recompute the shortest remaining missing
+        # prefix, publish its logprobs to siblings, and repeat. This lets
+        # candidates with longer shared prefixes extend the known results.
+        fill_count = 0
+        fill_start = time.perf_counter()
+        while True:
+            peer_fill_positions += self._fill_missing_from_peer_candidates(
+                results, request.candidates_tokens
+            )
+            fill_targets = [
+                (max(result.missing_positions), min(result.missing_positions), i)
+                for i, result in enumerate(results)
+                if isinstance(result, _CandidateScore) and result.missing_positions
+            ]
+            if not fill_targets:
+                break
+
+            fill_end, _, i = min(fill_targets)
+            result = results[i]
+            assert isinstance(result, _CandidateScore)
+            fill_count += 1
+            logger.info(
+                "Filling %d missing prompt logprobs for candidate %d up to "
+                "position %d (cached_tokens=%s)",
+                len(result.missing_positions),
+                i,
+                fill_end,
+                result.cached_tokens,
+            )
+            try:
+                results[i] = await self._fill_missing_candidate_logprobs(
+                    partial=result,
+                    token_ids=request.candidates_tokens[i],
+                    idx=i,
+                    request_base_id=base_id,
+                    prefix_len=request.prefix_len,
+                )
+            except Exception as exc:
+                results[i] = exc
+        fill_s = time.perf_counter() - fill_start
 
         scoring_s = time.perf_counter() - scoring_start
 
@@ -132,9 +179,20 @@ class ExtendedServing(OpenAIServing):
                     err_type="InternalError",
                     status_code=status,
                 )
-            _, score, cached = item
+            try:
+                score = self._aggregate_token_logprobs(
+                    item.token_logprobs,
+                    prefix_len=request.prefix_len,
+                    aggregation=request.aggregation,
+                )
+            except Exception as exc:
+                return self.create_error_response(
+                    f"Candidate {i} scoring failed: {exc}",
+                    err_type="InternalError",
+                    status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
             scores.append(score)
-            cached_tokens.append(cached)
+            cached_tokens.append(item.cached_tokens)
 
         best_index = max(range(n), key=lambda i: scores[i])
         total_s = time.perf_counter() - total_start
@@ -145,9 +203,16 @@ class ExtendedServing(OpenAIServing):
             cached_tokens=cached_tokens,
             profile={
                 "candidate_scoring_s": round(scoring_s, 6),
+                "peer_fill_positions": peer_fill_positions,
+                "cache_fill_s": round(fill_s, 6),
+                "cache_fill_requests": fill_count,
                 "total_s": round(total_s, 6),
             },
         )
+
+    @staticmethod
+    def _prefix_cache_order(candidates_tokens: list[list[int]]) -> list[int]:
+        return sorted(range(len(candidates_tokens)), key=lambda i: candidates_tokens[i])
 
     async def _score_candidate(
         self,
@@ -155,17 +220,39 @@ class ExtendedServing(OpenAIServing):
         idx: int,
         request_base_id: str,
         prefix_len: int,
-        aggregation: str,
         skip_reading_prefix_cache: bool = False,
-    ) -> tuple[int, float, int | None]:
+    ) -> _CandidateScore:
         """
         Score a candidate with a single engine request using prompt_logprobs=1.
 
-        One request per candidate (not per token).  If the KV cache overshot into
-        the scored suffix (cached_tokens > prefix_len), raises _CacheOverlapRetry
-        so the caller can retry sequentially with skip_reading_prefix_cache=True.
+        One request per candidate (not per token). Cached prompt positions are
+        returned as missing prompt_logprobs and filled by the caller if they
+        overlap the scored suffix.
         """
         request_id = f"ppl-{request_base_id}-{idx}"
+        final_res = await self._run_prompt_logprobs_request(
+            token_ids=token_ids,
+            request_id=request_id,
+            skip_reading_prefix_cache=skip_reading_prefix_cache,
+        )
+        token_logprobs, missing_positions = self._collect_candidate_logprobs(
+            token_ids=token_ids,
+            prompt_logprobs=final_res.prompt_logprobs,
+            prefix_len=prefix_len,
+        )
+        return _CandidateScore(
+            idx=idx,
+            token_logprobs=token_logprobs,
+            missing_positions=missing_positions,
+            cached_tokens=final_res.num_cached_tokens,
+        )
+
+    async def _run_prompt_logprobs_request(
+        self,
+        token_ids: list[int],
+        request_id: str,
+        skip_reading_prefix_cache: bool,
+    ):
         sampling_params = SamplingParams(
             max_tokens=1,
             prompt_logprobs=1,
@@ -180,66 +267,164 @@ class ExtendedServing(OpenAIServing):
             final_res = res
 
         if final_res is None or final_res.prompt_logprobs is None:
-            raise RuntimeError(f"No prompt_logprobs returned for candidate {idx}")
+            raise RuntimeError(f"No prompt_logprobs returned for request {request_id}")
 
-        cached = final_res.num_cached_tokens
+        return final_res
 
-        # If the cache overshot into the scored suffix, prompt_logprobs for
-        # positions prefix_len..cached-1 contain uninitialised tensors.
-        if not skip_reading_prefix_cache and cached is not None and cached > prefix_len:
-            logger.warning(
-                "Candidate %d: cached_tokens=%d > prefix_len=%d; signalling sequential retry",
-                idx, cached, prefix_len,
+    @staticmethod
+    def _score_start(prefix_len: int) -> int:
+        # prompt_logprobs[0] is always None: the first prompt token has no
+        # preceding context, so scoring all tokens starts from position 1.
+        return max(prefix_len, 1)
+
+    def _collect_candidate_logprobs(
+        self,
+        token_ids: list[int],
+        prompt_logprobs,
+        prefix_len: int,
+    ) -> tuple[list[float | None], list[int]]:
+        if len(prompt_logprobs) != len(token_ids):
+            raise RuntimeError(
+                f"Prompt logprobs length mismatch: got {len(prompt_logprobs)}, "
+                f"expected {len(token_ids)}"
             )
-            raise _CacheOverlapRetry()
 
-        chunk_logprobs: list[float] = []
-        missing_suffix_positions: list[int] = []
-        for i, entry in enumerate(final_res.prompt_logprobs):
-            if i < prefix_len:
+        token_logprobs: list[float | None] = [None] * len(token_ids)
+        missing_positions: list[int] = []
+        for i in range(self._score_start(prefix_len), len(token_ids)):
+            entry = prompt_logprobs[i]
+            if not entry:
+                missing_positions.append(i)
                 continue
-            if entry is None:
-                missing_suffix_positions.append(i - prefix_len)
-                continue
-            # Look up the actual prompt token, not the top-1 by probability.
             lp = entry.get(token_ids[i])
             if lp is not None:
-                chunk_logprobs.append(lp.logprob)
+                token_logprobs[i] = lp.logprob
             else:
-                missing_suffix_positions.append(i - prefix_len)
+                missing_positions.append(i)
+        return token_logprobs, missing_positions
 
-        expected = len(token_ids) - prefix_len
-        if len(chunk_logprobs) != expected:
-            missing_preview = missing_suffix_positions[:8]
-            if not skip_reading_prefix_cache:
-                logger.warning(
-                    "Candidate %d: incomplete prompt_logprobs scored=%d expected=%d "
-                    "cached_tokens=%s prefix_len=%d total_tokens=%d "
-                    "missing_count=%d missing_preview=%s; signalling sequential retry",
-                    idx,
-                    len(chunk_logprobs),
-                    expected,
-                    cached,
-                    prefix_len,
-                    len(token_ids),
-                    len(missing_suffix_positions),
-                    missing_preview,
-                )
-                raise _CacheOverlapRetry()
+    @staticmethod
+    def _prefix_matches_through(
+        left: list[int],
+        right: list[int],
+        pos: int,
+    ) -> bool:
+        return (
+            len(left) > pos
+            and len(right) > pos
+            and left[: pos + 1] == right[: pos + 1]
+        )
+
+    def _fill_missing_from_peer_candidates(
+        self,
+        results: list,
+        candidates_tokens: list[list[int]],
+    ) -> int:
+        candidate_results = [
+            (i, result)
+            for i, result in enumerate(results)
+            if isinstance(result, _CandidateScore)
+        ]
+        if len(candidate_results) < 2:
+            return 0
+
+        num_filled = 0
+        for i, result in candidate_results:
+            if not result.missing_positions:
+                continue
+
+            remaining_positions: list[int] = []
+            token_ids = candidates_tokens[i]
+            for pos in result.missing_positions:
+                peer_logprob = None
+                for peer_i, peer_result in candidate_results:
+                    if (
+                        peer_i == i
+                        or pos >= len(peer_result.token_logprobs)
+                        or peer_result.token_logprobs[pos] is None
+                    ):
+                        continue
+                    if self._prefix_matches_through(
+                        token_ids, candidates_tokens[peer_i], pos
+                    ):
+                        peer_logprob = peer_result.token_logprobs[pos]
+                        break
+
+                if peer_logprob is None:
+                    remaining_positions.append(pos)
+                else:
+                    result.token_logprobs[pos] = peer_logprob
+                    num_filled += 1
+
+            result.missing_positions = remaining_positions
+
+        return num_filled
+
+    async def _fill_missing_candidate_logprobs(
+        self,
+        partial: _CandidateScore,
+        token_ids: list[int],
+        idx: int,
+        request_base_id: str,
+        prefix_len: int,
+    ) -> _CandidateScore:
+        fill_end = max(partial.missing_positions)
+        fill_token_ids = token_ids[: fill_end + 1]
+        request_id = f"ppl-{request_base_id}-fill-{idx}-{fill_end}"
+        final_res = await self._run_prompt_logprobs_request(
+            token_ids=fill_token_ids,
+            request_id=request_id,
+            skip_reading_prefix_cache=True,
+        )
+        fill_logprobs, _ = self._collect_candidate_logprobs(
+            token_ids=fill_token_ids,
+            prompt_logprobs=final_res.prompt_logprobs,
+            prefix_len=prefix_len,
+        )
+
+        still_missing: list[int] = []
+        for pos in partial.missing_positions:
+            logprob = fill_logprobs[pos]
+            if logprob is None:
+                still_missing.append(pos)
+            else:
+                partial.token_logprobs[pos] = logprob
+
+        partial.missing_positions = still_missing
+        if still_missing:
+            missing_preview = still_missing[:8]
             raise RuntimeError(
-                f"Candidate {idx}: scored {len(chunk_logprobs)} tokens, "
-                f"expected {expected} (prefix_len={prefix_len}, "
-                f"cached_tokens={cached}, total_tokens={len(token_ids)}, "
-                f"missing_count={len(missing_suffix_positions)}, "
+                f"Candidate {idx}: incomplete prompt_logprobs after cache fill "
+                f"(prefix_len={prefix_len}, total_tokens={len(token_ids)}, "
+                f"missing_count={len(still_missing)}, "
                 f"missing_preview={missing_preview})"
             )
+        return partial
 
-        score = (
-            sum(chunk_logprobs) / len(chunk_logprobs)
+    def _aggregate_token_logprobs(
+        self,
+        token_logprobs: list[float | None],
+        prefix_len: int,
+        aggregation: str,
+    ) -> float:
+        logprobs = token_logprobs[self._score_start(prefix_len) :]
+        if any(logprob is None for logprob in logprobs):
+            missing_positions = [
+                i
+                for i, logprob in enumerate(token_logprobs)
+                if i >= self._score_start(prefix_len) and logprob is None
+            ]
+            raise RuntimeError(
+                "Cannot aggregate incomplete prompt_logprobs "
+                f"(missing_count={len(missing_positions)}, "
+                f"missing_preview={missing_positions[:8]})"
+            )
+        complete_logprobs = [logprob for logprob in logprobs if logprob is not None]
+        return (
+            sum(complete_logprobs) / len(complete_logprobs)
             if aggregation == "mean"
-            else sum(chunk_logprobs)
+            else sum(complete_logprobs)
         )
-        return idx, score, cached
 
     # ------------------------------------------------------------------
     # AB Pairwise
@@ -287,7 +472,9 @@ class ExtendedServing(OpenAIServing):
             else:
                 ids, cached = item
                 text = tokenizer.decode(ids, skip_special_tokens=True)
-                results.append(ABPairwiseResult(token_ids=ids, text=text, cached_tokens=cached))
+                results.append(
+                    ABPairwiseResult(token_ids=ids, text=text, cached_tokens=cached)
+                )
 
         return ABPairwiseResponse(
             results=results,
