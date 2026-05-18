@@ -40,7 +40,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
@@ -298,6 +298,80 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
     )
 
     assert GPUModelRunner.sample_tokens(runner, None) is None
+
+
+def test_get_prompt_logprobs_dict_uses_memory_efficient_topk(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class FakeCudaLogits:
+        def __init__(self, shape):
+            self.shape = shape
+
+        is_cuda = True
+
+    num_prompt_tokens = gpu_model_runner_module._PROMPT_LOGPROBS_CHUNK_SIZE + 2
+    prompt_token_ids = list(range(num_prompt_tokens))
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.num_prompt_logprobs = {"req": 0}
+    runner.query_start_loc = SimpleNamespace(np=np.array([0]))
+    runner.input_batch = SimpleNamespace(req_id_to_index={"req": 0})
+    runner.requests = {
+        "req": CachedRequestState(
+            req_id="req",
+            prompt_token_ids=prompt_token_ids,
+            mm_features=[],
+            sampling_params=None,
+            generator=None,
+            block_ids=([0],),
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+    }
+    runner.model = SimpleNamespace(
+        compute_logits=lambda hidden_states: FakeCudaLogits(hidden_states.shape)
+    )
+    runner.sampler = SimpleNamespace(
+        compute_logprobs=lambda _: pytest.fail("full logprobs should not be used"),
+        gather_logprobs=lambda *_: pytest.fail("full logprobs should not be used"),
+    )
+    runner._sync_device = lambda: None
+
+    chunk_sizes: list[int] = []
+
+    def fake_compute_topk_logprobs(logits, num_logprobs, sampled_token_ids):
+        chunk_sizes.append(len(sampled_token_ids))
+        assert logits.shape[0] == len(sampled_token_ids)
+        assert logits.shape[1] == 5
+        assert num_logprobs == 0
+        return gpu_model_runner_module.LogprobsTensors(
+            logprob_token_ids=sampled_token_ids.unsqueeze(-1).to(torch.int32),
+            logprobs=torch.arange(
+                len(sampled_token_ids), dtype=torch.float32
+            ).unsqueeze(-1),
+            selected_token_ranks=torch.ones(
+                len(sampled_token_ids), dtype=torch.int32
+            ),
+        )
+
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "compute_topk_logprobs",
+        fake_compute_topk_logprobs,
+    )
+
+    result = GPUModelRunner._get_prompt_logprobs_dict(
+        runner,
+        hidden_states=torch.randn(num_prompt_tokens - 1, 5),
+        num_scheduled_tokens={"req": num_prompt_tokens},
+    )
+
+    tensors = result["req"]
+    assert chunk_sizes == [gpu_model_runner_module._PROMPT_LOGPROBS_CHUNK_SIZE, 1]
+    assert tensors.logprob_token_ids[:3, 0].tolist() == [1, 2, 3]
+    assert tensors.logprob_token_ids[-1, 0].item() == num_prompt_tokens - 1
+    assert "req" not in runner.num_prompt_logprobs
+    assert runner.requests["req"].in_progress_prompt_logprobs_cpu is None
 
 
 def test_select_common_block_size_no_valid_option():

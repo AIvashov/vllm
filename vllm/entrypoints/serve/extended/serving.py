@@ -100,6 +100,7 @@ class ExtendedServing(OpenAIServing):
         scoring_start = time.perf_counter()
         results: list[_CandidateScore | BaseException | None] = [None] * n
         peer_fill_positions = 0
+        fatal_error_seen = False
 
         # Phase 1: score candidates in a prefix-friendly order. Lexicographic
         # sorting keeps shared prefixes adjacent and naturally places a shorter
@@ -115,6 +116,9 @@ class ExtendedServing(OpenAIServing):
                 )
             except Exception as exc:
                 results[i] = exc
+                if _is_engine_fatal(exc):
+                    fatal_error_seen = True
+                    break
             else:
                 peer_fill_positions += self._fill_missing_from_peer_candidates(
                     results, request.candidates_tokens
@@ -127,7 +131,7 @@ class ExtendedServing(OpenAIServing):
         # candidates with longer shared prefixes extend the known results.
         fill_count = 0
         fill_start = time.perf_counter()
-        while True:
+        while not fatal_error_seen:
             peer_fill_positions += self._fill_missing_from_peer_candidates(
                 results, request.candidates_tokens
             )
@@ -161,13 +165,30 @@ class ExtendedServing(OpenAIServing):
                 )
             except Exception as exc:
                 results[i] = exc
+                if _is_engine_fatal(exc):
+                    fatal_error_seen = True
+                    break
         fill_s = time.perf_counter() - fill_start
 
         scoring_s = time.perf_counter() - scoring_start
 
+        for i, item in enumerate(results):
+            if isinstance(item, BaseException) and _is_engine_fatal(item):
+                return self.create_error_response(
+                    f"Candidate {i} scoring failed: {item}",
+                    err_type="InternalError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+
         scores: list[float] = []
         cached_tokens: list[int | None] = []
         for i, item in enumerate(results):
+            if item is None:
+                return self.create_error_response(
+                    f"Candidate {i} scoring skipped after a previous failure",
+                    err_type="InternalError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
             if isinstance(item, BaseException):
                 status = (
                     HTTPStatus.INTERNAL_SERVER_ERROR
@@ -255,7 +276,7 @@ class ExtendedServing(OpenAIServing):
     ):
         sampling_params = SamplingParams(
             max_tokens=1,
-            prompt_logprobs=1,
+            prompt_logprobs=0,
             detokenize=False,
             skip_reading_prefix_cache=skip_reading_prefix_cache,
         )
