@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 @dataclasses.dataclass
 class StructuredOutputRequest:
     params: StructuredOutputsParams
+    resume_token_ids: list[int] | None = None
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
@@ -37,7 +38,27 @@ class StructuredOutputRequest:
         params = sampling_params.structured_outputs
         if not params or params.all_constraints_none():
             return None
-        return StructuredOutputRequest(params=params)
+
+        resume_token_ids: list[int] | None = None
+        if sampling_params.extra_args is not None:
+            raw_resume_token_ids = sampling_params.extra_args.get(
+                "structured_output_resume_token_ids"
+            )
+            if raw_resume_token_ids is not None:
+                if not isinstance(raw_resume_token_ids, list) or not all(
+                    type(token_id) is int for token_id in raw_resume_token_ids
+                ):
+                    raise ValueError(
+                        "structured_output_resume_token_ids must be a list of integers"
+                    )
+                if any(token_id < 0 for token_id in raw_resume_token_ids):
+                    raise ValueError(
+                        "structured_output_resume_token_ids must contain only "
+                        "non-negative token ids"
+                    )
+                resume_token_ids = list(raw_resume_token_ids)
+
+        return StructuredOutputRequest(params=params, resume_token_ids=resume_token_ids)
 
     def _check_grammar_completion(self) -> bool:
         # NOTE: We have to lazy import to gate circular imports
