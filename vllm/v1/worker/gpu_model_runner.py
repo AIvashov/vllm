@@ -194,7 +194,6 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -223,8 +222,6 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
-
-_PROMPT_LOGPROBS_CHUNK_SIZE = 1024
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -5193,59 +5190,34 @@ class GPUModelRunner(
                 # step. There are no more prompt logprobs to produce.
                 continue
 
+            # Get the logits corresponding to this req's prompt tokens.
+            # If this is a partial request (i.e. chunked prefill),
+            # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
+            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+            logits = self.model.compute_logits(prompt_hidden_states)
 
-            for chunk_start in range(
-                0, num_logits, _PROMPT_LOGPROBS_CHUNK_SIZE
-            ):
-                chunk_end = min(
-                    chunk_start + _PROMPT_LOGPROBS_CHUNK_SIZE,
-                    num_logits,
-                )
+            # Get the "target" tokens for each index. For prompt at index i,
+            # the token at prompt index i+1 is the "sampled" token we want
+            # to gather the logprob for.
+            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
 
-                # Get the logits corresponding to this req's prompt tokens.
-                # If this is a partial request (i.e. chunked prefill), then
-                # there is prompt logprob generated for each index.
-                prompt_hidden_states = hidden_states[
-                    offset + chunk_start : offset + chunk_end
-                ]
-                logits = self.model.compute_logits(prompt_hidden_states)
+            # Compute prompt logprobs.
+            logprobs = self.sampler.compute_logprobs(logits)
+            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                logprobs, num_prompt_logprobs, tgt_token_ids
+            )
 
-                # For prompt at index i, the token at prompt index i+1 is the
-                # "sampled" token we want to gather the logprob for.
-                tgt_token_ids = prompt_token_ids[
-                    start_tok + chunk_start : start_tok + chunk_end
-                ]
-
-                if logits.is_cuda:
-                    # Compute prompt logprobs without materializing the full
-                    # [num_prompt_tokens, vocab_size] logprobs matrix.
-                    token_ids, logprobs, ranks, _ = compute_topk_logprobs(
-                        logits, num_prompt_logprobs, tgt_token_ids
-                    )
-                else:
-                    # CPUModelRunner inherits this method, but the
-                    # memory-efficient implementation relies on GPU Triton
-                    # kernels.
-                    logprobs = self.sampler.compute_logprobs(logits)
-                    token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                        logprobs, num_prompt_logprobs, tgt_token_ids
-                    )
-
-                # Transfer GPU->CPU async.
-                chunk_slice = slice(
-                    start_idx + chunk_start, start_idx + chunk_end
-                )
-                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                    token_ids, non_blocking=True
-                )
-                logprobs_tensors.logprobs[chunk_slice].copy_(
-                    logprobs, non_blocking=True
-                )
-                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                    ranks, non_blocking=True
-                )
+            # Transfer GPU->CPU async.
+            chunk_slice = slice(start_idx, start_idx + num_logits)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                token_ids, non_blocking=True
+            )
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                ranks, non_blocking=True
+            )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
