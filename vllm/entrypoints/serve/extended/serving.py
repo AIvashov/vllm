@@ -11,15 +11,18 @@ from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.serve.disagg.mm_features import build_mm_input_from_features
-from vllm.entrypoints.serve.disagg.protocol import MultiModalFeatures
+from vllm.entrypoints.serve.disagg.mm_features import (
+    restore_mm_kwargs,
+    restore_mm_placeholders,
+)
 from vllm.entrypoints.serve.extended.protocol import (
     ABPairwiseRequest,
     ABPairwiseResponse,
     ABPairwiseResult,
 )
-from vllm.inputs import tokens_input
+from vllm.inputs import EngineInput, mm_input, tokens_input
 from vllm.logger import init_logger
+from vllm.multimodal.inputs import MultiModalKwargsItems
 from vllm.sampling_params import SamplingParams
 
 logger = init_logger(__name__)
@@ -54,22 +57,39 @@ class ExtendedServing(OpenAIServing):
 
         base_id = self._base_request_id(raw_request)
         total_start = time.perf_counter()
-        candidates_features = request.candidates_features or [None] * n
+        if request.shared_features is None:
+            engine_inputs: list[EngineInput] = [
+                tokens_input(prompt, cache_salt=request.cache_salt)
+                for prompt in request.candidates_prompts
+            ]
+        else:
+            shared_mm_kwargs = MultiModalKwargsItems(
+                restore_mm_kwargs(request.shared_features)
+            )
+            shared_mm_placeholders = restore_mm_placeholders(request.shared_features)
+            engine_inputs = [
+                mm_input(
+                    prompt_token_ids=prompt,
+                    mm_kwargs=shared_mm_kwargs,
+                    mm_hashes=request.shared_features.mm_hashes,
+                    mm_placeholders=shared_mm_placeholders,
+                    cache_salt=request.cache_salt,
+                )
+                for prompt in request.candidates_prompts
+            ]
 
         scoring_start = time.perf_counter()
         raw_results = await asyncio.gather(
             *[
                 self._run_pairwise_prompt(
-                    token_ids=prompt,
-                    features=candidates_features[i],
+                    engine_input=engine_input,
                     idx=i,
                     base_id=base_id,
                     temperature=request.temperature,
                     seed=request.seed,
                     allowed_token_ids=request.allowed_token_ids,
-                    cache_salt=request.cache_salt,
                 )
-                for i, prompt in enumerate(request.candidates_prompts)
+                for i, engine_input in enumerate(engine_inputs)
             ],
             return_exceptions=True,
         )
@@ -98,14 +118,12 @@ class ExtendedServing(OpenAIServing):
 
     async def _run_pairwise_prompt(
         self,
-        token_ids: list[int],
-        features: MultiModalFeatures | None,
+        engine_input: EngineInput,
         idx: int,
         base_id: str,
         temperature: float,
         seed: int,
         allowed_token_ids: list[int] | None,
-        cache_salt: str | None,
     ) -> tuple[list[int], int | None]:
         request_id = f"abpw-{base_id}-{idx}"
         sampling_params = SamplingParams(
@@ -114,15 +132,6 @@ class ExtendedServing(OpenAIServing):
             seed=seed + idx,
             detokenize=False,
             allowed_token_ids=allowed_token_ids,
-        )
-        engine_input = (
-            tokens_input(token_ids, cache_salt=cache_salt)
-            if features is None
-            else build_mm_input_from_features(
-                token_ids=token_ids,
-                features=features,
-                cache_salt=cache_salt,
-            )
         )
         result_gen = self.engine_client.generate(
             engine_input, sampling_params, request_id

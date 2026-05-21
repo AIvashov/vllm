@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
-from pydantic import ValidationError
 
 from vllm.entrypoints.serve.disagg.mm_serde import encode_mm_kwargs_item
 from vllm.entrypoints.serve.disagg.protocol import (
@@ -26,12 +25,18 @@ MODEL_NAME = "openai-community/gpt2"
 
 async def _make_serving_and_run(
     *,
-    token_ids: list[int],
-    features: MultiModalFeatures | None,
+    request: ABPairwiseRequest,
 ):
     serving = object.__new__(ExtendedServing)
     serving.engine_client = MagicMock()
+    serving._check_model = MagicMock()
+    serving._base_request_id = MagicMock(return_value="base")
+    serving.renderer = MagicMock()
+    serving.renderer.get_tokenizer.return_value.decode.return_value = "decoded"
     captured_engine_inputs = []
+
+    async def no_error(*args, **kwargs):
+        return None
 
     async def mock_generate(engine_input, *args, **kwargs):
         captured_engine_inputs.append(engine_input)
@@ -40,20 +45,12 @@ async def _make_serving_and_run(
             num_cached_tokens=7,
         )
 
+    serving._check_model.side_effect = no_error
     serving.engine_client.generate = MagicMock(side_effect=mock_generate)
 
-    result = await serving._run_pairwise_prompt(
-        token_ids=token_ids,
-        features=features,
-        idx=0,
-        base_id="base",
-        temperature=0.0,
-        seed=42042,
-        allowed_token_ids=[1, 2],
-        cache_salt="salt",
-    )
+    response = await serving.create_ab_pairwise(request, SimpleNamespace())
 
-    return result, captured_engine_inputs[0]
+    return response, captured_engine_inputs
 
 
 def test_ab_pairwise_request_accepts_legacy_payload():
@@ -63,33 +60,44 @@ def test_ab_pairwise_request_accepts_legacy_payload():
         allowed_token_ids=[10, 11],
     )
 
-    assert request.candidates_features is None
+    assert request.shared_features is None
 
 
-def test_ab_pairwise_request_rejects_mismatched_features_length():
-    with pytest.raises(ValidationError, match="candidates_features length"):
-        ABPairwiseRequest(
-            model=MODEL_NAME,
-            candidates_prompts=[[1], [2]],
-            candidates_features=[None],
-        )
+def test_ab_pairwise_request_accepts_shared_features():
+    features = MultiModalFeatures(
+        mm_hashes={"image": ["hash"]},
+        mm_placeholders={"image": [PlaceholderRangeInfo(offset=0, length=2)]},
+    )
+    request = ABPairwiseRequest(
+        model=MODEL_NAME,
+        candidates_prompts=[[1, 2]],
+        shared_features=features,
+    )
+
+    assert request.shared_features == features
 
 
 @pytest.mark.asyncio
-async def test_run_pairwise_prompt_uses_tokens_input_for_text_only():
-    result, engine_input = await _make_serving_and_run(
-        token_ids=[1, 2, 3],
-        features=None,
+async def test_create_ab_pairwise_uses_tokens_input_for_text_only():
+    response, engine_inputs = await _make_serving_and_run(
+        request=ABPairwiseRequest(
+            model=MODEL_NAME,
+            candidates_prompts=[[1, 2, 3]],
+            allowed_token_ids=[1, 2],
+            cache_salt="salt",
+        ),
     )
 
-    assert result == ([42], 7)
+    assert response.results[0].token_ids == [42]
+    assert response.results[0].cached_tokens == 7
+    engine_input = engine_inputs[0]
     assert engine_input["type"] == "token"
     assert engine_input["prompt_token_ids"] == [1, 2, 3]
     assert engine_input["cache_salt"] == "salt"
 
 
 @pytest.mark.asyncio
-async def test_run_pairwise_prompt_uses_mm_input_for_features_cache_hit():
+async def test_create_ab_pairwise_uses_mm_input_for_shared_features_cache_hit():
     features = MultiModalFeatures(
         mm_hashes={"image": ["hash"]},
         mm_placeholders={
@@ -103,13 +111,20 @@ async def test_run_pairwise_prompt_uses_mm_input_for_features_cache_hit():
         },
     )
 
-    _, engine_input = await _make_serving_and_run(
-        token_ids=[1, 2, 3],
-        features=features,
+    _, engine_inputs = await _make_serving_and_run(
+        request=ABPairwiseRequest(
+            model=MODEL_NAME,
+            candidates_prompts=[[1, 2, 3]],
+            shared_features=features,
+            allowed_token_ids=[1, 2],
+            cache_salt="salt",
+        ),
     )
 
+    engine_input = engine_inputs[0]
     assert engine_input["type"] == "multimodal"
     assert engine_input["prompt_token_ids"] == [1, 2, 3]
+    assert engine_input["cache_salt"] == "salt"
     assert engine_input["mm_kwargs"]["image"] == [None]
     placeholder = engine_input["mm_placeholders"]["image"][0]
     assert placeholder.is_embed is not None
@@ -118,7 +133,7 @@ async def test_run_pairwise_prompt_uses_mm_input_for_features_cache_hit():
 
 
 @pytest.mark.asyncio
-async def test_run_pairwise_prompt_decodes_kwargs_data():
+async def test_create_ab_pairwise_decodes_shared_kwargs_data():
     elem = MultiModalFieldElem(
         data=torch.ones(2, dtype=torch.float32),
         field=MultiModalBatchedField(),
@@ -130,11 +145,19 @@ async def test_run_pairwise_prompt_decodes_kwargs_data():
         kwargs_data={"image": [encode_mm_kwargs_item(item)]},
     )
 
-    _, engine_input = await _make_serving_and_run(
-        token_ids=[1, 2],
-        features=features,
+    _, engine_inputs = await _make_serving_and_run(
+        request=ABPairwiseRequest(
+            model=MODEL_NAME,
+            candidates_prompts=[[1, 2], [3, 4]],
+            shared_features=features,
+        ),
     )
 
+    engine_input = engine_inputs[0]
     decoded_item = engine_input["mm_kwargs"]["image"][0]
     assert decoded_item is not None
     assert torch.equal(decoded_item["pixel_values"].data, elem.data)
+    assert len(engine_inputs) == 2
+    assert engine_inputs[1]["prompt_token_ids"] == [3, 4]
+    assert engine_inputs[1]["mm_kwargs"] is engine_input["mm_kwargs"]
+    assert engine_inputs[1]["mm_placeholders"] is engine_input["mm_placeholders"]
