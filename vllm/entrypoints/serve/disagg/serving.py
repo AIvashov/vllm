@@ -7,7 +7,6 @@ import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 
-import torch
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -26,51 +25,24 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.engine.serving import OpenAIServing, clamp_prompt_logprobs
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.serve.disagg.mm_serde import decode_mm_kwargs_item
+from vllm.entrypoints.serve.disagg.mm_features import build_mm_input_from_features
 from vllm.entrypoints.serve.disagg.protocol import (
     GenerateRequest,
     GenerateResponse,
     GenerateResponseChoice,
     GenerateResponseStreamChoice,
     GenerateStreamResponse,
-    MultiModalFeatures,
 )
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.utils import should_include_usage
-from vllm.inputs import EngineInput, mm_input
+from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.multimodal.inputs import (
-    MultiModalKwargsItem,
-    MultiModalKwargsItems,
-    PlaceholderRange,
-)
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
-
-
-def _restore_mm_placeholders(
-    features: MultiModalFeatures,
-) -> dict[str, list[PlaceholderRange]]:
-    """Convert serialized placeholder metadata back to engine ranges."""
-    return {
-        modality: [
-            PlaceholderRange(
-                offset=p.offset,
-                length=p.length,
-                is_embed=(
-                    None
-                    if p.is_embed is None
-                    else torch.tensor(p.is_embed, dtype=torch.bool)
-                ),
-            )
-            for p in ranges
-        ]
-        for modality, ranges in features.mm_placeholders.items()
-    }
 
 
 class ServingTokens(OpenAIServing):
@@ -135,26 +107,9 @@ class ServingTokens(OpenAIServing):
 
         engine_input: EngineInput
         if features := request.features:
-            # Convert PlaceholderRangeInfo → PlaceholderRange per modality.
-            mm_placeholders = _restore_mm_placeholders(features)
-
-            # Deserialize tensor data when present; None → cache hit.
-            mm_kwargs: dict[str, list[MultiModalKwargsItem | None]] = {}
-            if features.kwargs_data is not None:
-                for modality, items in features.kwargs_data.items():
-                    mm_kwargs[modality] = [
-                        decode_mm_kwargs_item(item) if item is not None else None
-                        for item in items
-                    ]
-            else:
-                for modality, hashes in features.mm_hashes.items():
-                    mm_kwargs[modality] = [None] * len(hashes)
-
-            engine_input = mm_input(
-                prompt_token_ids=request.token_ids,
-                mm_kwargs=MultiModalKwargsItems(mm_kwargs),
-                mm_hashes=features.mm_hashes,
-                mm_placeholders=mm_placeholders,
+            engine_input = build_mm_input_from_features(
+                token_ids=request.token_ids,
+                features=features,
                 cache_salt=request.cache_salt,
             )
         else:

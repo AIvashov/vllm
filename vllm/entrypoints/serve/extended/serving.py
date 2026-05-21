@@ -11,6 +11,8 @@ from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.serve.disagg.mm_features import build_mm_input_from_features
+from vllm.entrypoints.serve.disagg.protocol import MultiModalFeatures
 from vllm.entrypoints.serve.extended.protocol import (
     ABPairwiseRequest,
     ABPairwiseResponse,
@@ -52,17 +54,20 @@ class ExtendedServing(OpenAIServing):
 
         base_id = self._base_request_id(raw_request)
         total_start = time.perf_counter()
+        candidates_features = request.candidates_features or [None] * n
 
         scoring_start = time.perf_counter()
         raw_results = await asyncio.gather(
             *[
                 self._run_pairwise_prompt(
                     token_ids=prompt,
+                    features=candidates_features[i],
                     idx=i,
                     base_id=base_id,
                     temperature=request.temperature,
                     seed=request.seed,
                     allowed_token_ids=request.allowed_token_ids,
+                    cache_salt=request.cache_salt,
                 )
                 for i, prompt in enumerate(request.candidates_prompts)
             ],
@@ -94,11 +99,13 @@ class ExtendedServing(OpenAIServing):
     async def _run_pairwise_prompt(
         self,
         token_ids: list[int],
+        features: MultiModalFeatures | None,
         idx: int,
         base_id: str,
         temperature: float,
         seed: int,
         allowed_token_ids: list[int] | None,
+        cache_salt: str | None,
     ) -> tuple[list[int], int | None]:
         request_id = f"abpw-{base_id}-{idx}"
         sampling_params = SamplingParams(
@@ -108,8 +115,17 @@ class ExtendedServing(OpenAIServing):
             detokenize=False,
             allowed_token_ids=allowed_token_ids,
         )
+        engine_input = (
+            tokens_input(token_ids, cache_salt=cache_salt)
+            if features is None
+            else build_mm_input_from_features(
+                token_ids=token_ids,
+                features=features,
+                cache_salt=cache_salt,
+            )
+        )
         result_gen = self.engine_client.generate(
-            tokens_input(token_ids), sampling_params, request_id
+            engine_input, sampling_params, request_id
         )
         final_res = None
         async for res in result_gen:
