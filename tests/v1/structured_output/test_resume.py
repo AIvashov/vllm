@@ -71,24 +71,29 @@ def test_create_grammar_replays_resume_token_ids():
         StructuredOutputOptions.JSON, '{"type": "object"}'
     )
     grammar.accept_tokens.assert_called_once_with("resume-request", [10, 11])
+    grammar.reset.assert_not_called()
+    assert structured_output_request.resume_replay_failed is False
 
 
-def test_create_grammar_rejects_invalid_resume_prefix():
+def test_create_grammar_resets_after_rejected_resume_prefix():
     manager = object.__new__(StructuredOutputManager)
     grammar = Mock()
     grammar.accept_tokens.return_value = False
     manager.backend = Mock()
     manager.backend.compile_grammar.return_value = grammar
 
+    structured_output_request = StructuredOutputRequest(
+        params=StructuredOutputsParams(json='{"type": "object"}'),
+        resume_token_ids=[10, 11],
+    )
     request = Mock(
         request_id="resume-request",
-        structured_output_request=StructuredOutputRequest(
-            params=StructuredOutputsParams(json='{"type": "object"}'),
-            resume_token_ids=[10, 11],
-        ),
+        structured_output_request=structured_output_request,
     )
 
-    with pytest.raises(ValueError, match="rejected resume prefix"):
-        manager._create_grammar(request)
+    result = manager._create_grammar(request)
 
+    assert result is grammar
     grammar.accept_tokens.assert_called_once_with("resume-request", [10, 11])
+    grammar.reset.assert_called_once()
+    assert structured_output_request.resume_replay_failed is True

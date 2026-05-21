@@ -188,11 +188,13 @@ class StructuredOutputManager:
         if resume_token_ids:
             accepted = grammar.accept_tokens(request.request_id, resume_token_ids)
             if not accepted:
-                raise ValueError(
+                logger.warning(
                     "structured_output_resume_token_ids are not accepted by "
-                    f"grammar for request {request.request_id}: rejected "
-                    "resume prefix"
+                    "grammar for request %s; continuing without resume replay",
+                    request.request_id,
                 )
+                grammar.reset()
+                structured_output_request.resume_replay_failed = True
 
         return grammar
 

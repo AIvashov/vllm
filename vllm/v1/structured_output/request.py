@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 class StructuredOutputRequest:
     params: StructuredOutputsParams
     resume_token_ids: list[int] | None = None
+    resume_replay_failed: bool = False
     _grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar | None = None
     reasoning_ended: bool | None = None
     reasoning_parser_kwargs: dict[str, Any] | None = None
