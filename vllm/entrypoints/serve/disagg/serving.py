@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 
+import torch
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -32,6 +33,7 @@ from vllm.entrypoints.serve.disagg.protocol import (
     GenerateResponseChoice,
     GenerateResponseStreamChoice,
     GenerateStreamResponse,
+    MultiModalFeatures,
 )
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.entrypoints.utils import should_include_usage
@@ -48,6 +50,27 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils.collection_utils import as_list
 
 logger = init_logger(__name__)
+
+
+def _restore_mm_placeholders(
+    features: MultiModalFeatures,
+) -> dict[str, list[PlaceholderRange]]:
+    """Convert serialized placeholder metadata back to engine ranges."""
+    return {
+        modality: [
+            PlaceholderRange(
+                offset=p.offset,
+                length=p.length,
+                is_embed=(
+                    None
+                    if p.is_embed is None
+                    else torch.tensor(p.is_embed, dtype=torch.bool)
+                ),
+            )
+            for p in ranges
+        ]
+        for modality, ranges in features.mm_placeholders.items()
+    }
 
 
 class ServingTokens(OpenAIServing):
@@ -113,12 +136,7 @@ class ServingTokens(OpenAIServing):
         engine_input: EngineInput
         if features := request.features:
             # Convert PlaceholderRangeInfo → PlaceholderRange per modality.
-            mm_placeholders: dict[str, list[PlaceholderRange]] = {
-                modality: [
-                    PlaceholderRange(offset=p.offset, length=p.length) for p in ranges
-                ]
-                for modality, ranges in features.mm_placeholders.items()
-            }
+            mm_placeholders = _restore_mm_placeholders(features)
 
             # Deserialize tensor data when present; None → cache hit.
             mm_kwargs: dict[str, list[MultiModalKwargsItem | None]] = {}

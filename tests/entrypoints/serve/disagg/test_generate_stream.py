@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import torch
 
 from vllm.config.multimodal import MultiModalConfig
 from vllm.entrypoints.openai.engine.protocol import StreamOptions
@@ -15,8 +16,13 @@ from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.disagg.protocol import (
     GenerateRequest,
     GenerateResponse,
+    MultiModalFeatures,
+    PlaceholderRangeInfo,
 )
-from vllm.entrypoints.serve.disagg.serving import ServingTokens
+from vllm.entrypoints.serve.disagg.serving import (
+    ServingTokens,
+    _restore_mm_placeholders,
+)
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -195,6 +201,30 @@ async def test_serve_tokens_skips_mm_cache_for_remote_engine_execution():
         ]
         is True
     )
+
+
+def test_restore_mm_placeholders_converts_is_embed_to_bool_tensor():
+    features = MultiModalFeatures(
+        mm_hashes={"image": ["hash"], "audio": ["legacy-hash"]},
+        mm_placeholders={
+            "image": [
+                PlaceholderRangeInfo(
+                    offset=0,
+                    length=3,
+                    is_embed=[False, True, False],
+                )
+            ],
+            "audio": [PlaceholderRangeInfo(offset=5, length=2)],
+        },
+    )
+
+    mm_placeholders = _restore_mm_placeholders(features)
+
+    placeholder = mm_placeholders["image"][0]
+    assert placeholder.is_embed is not None
+    assert placeholder.is_embed.dtype == torch.bool
+    assert placeholder.is_embed.tolist() == [False, True, False]
+    assert mm_placeholders["audio"][0].is_embed is None
 
 
 @pytest.mark.asyncio

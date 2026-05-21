@@ -373,7 +373,16 @@ class OpenAIServingRender:
 
         mm_placeholders = {
             modality: [
-                PlaceholderRangeInfo(offset=p.offset, length=p.length) for p in ranges
+                PlaceholderRangeInfo(
+                    offset=p.offset,
+                    length=p.length,
+                    is_embed=(
+                        None
+                        if p.is_embed is None
+                        else p.is_embed.detach().cpu().bool().tolist()
+                    ),
+                )
+                for p in ranges
             ]
             for modality, ranges in raw_placeholders.items()
         }
