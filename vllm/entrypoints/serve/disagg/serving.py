@@ -29,7 +29,7 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.engine.serving import OpenAIServing, clamp_prompt_logprobs
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
-from vllm.entrypoints.serve.disagg.mm_serde import decode_mm_kwargs_item
+from vllm.entrypoints.serve.disagg.mm_features import build_mm_input_from_features
 from vllm.entrypoints.serve.disagg.protocol import (
     GenerateRequest,
     GenerateResponse,
@@ -42,11 +42,6 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs import EngineInput, mm_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.multimodal.inputs import (
-    MultiModalKwargsItem,
-    MultiModalKwargsItems,
-    PlaceholderRange,
-)
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils.collection_utils import as_list
@@ -140,31 +135,9 @@ class ServingTokens(OpenAIServing):
 
         engine_input: EngineInput
         if features := request.features:
-            # Convert PlaceholderRangeInfo → PlaceholderRange per modality.
-            mm_placeholders: dict[str, list[PlaceholderRange]] = {
-                modality: [
-                    PlaceholderRange(offset=p.offset, length=p.length) for p in ranges
-                ]
-                for modality, ranges in features.mm_placeholders.items()
-            }
-
-            # Deserialize tensor data when present; None → cache hit.
-            mm_kwargs: dict[str, list[MultiModalKwargsItem | None]] = {}
-            if features.kwargs_data is not None:
-                for modality, items in features.kwargs_data.items():
-                    mm_kwargs[modality] = [
-                        decode_mm_kwargs_item(item) if item is not None else None
-                        for item in items
-                    ]
-            else:
-                for modality, hashes in features.mm_hashes.items():
-                    mm_kwargs[modality] = [None] * len(hashes)
-
-            engine_input = mm_input(
-                prompt_token_ids=request.token_ids,
-                mm_kwargs=MultiModalKwargsItems(mm_kwargs),
-                mm_hashes=features.mm_hashes,
-                mm_placeholders=mm_placeholders,
+            engine_input = build_mm_input_from_features(
+                token_ids=request.token_ids,
+                features=features,
                 cache_salt=request.cache_salt,
             )
         else:

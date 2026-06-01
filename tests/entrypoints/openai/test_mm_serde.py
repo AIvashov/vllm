@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Roundtrip tests for multimodal serde used by the disagg generate endpoint."""
 
+import pytest
 import torch
+from pydantic import ValidationError
 
 from vllm.entrypoints.serve.disagg.mm_serde import (
     decode_mm_kwargs_item,
@@ -12,13 +14,73 @@ from vllm.entrypoints.serve.disagg.protocol import (
     MultiModalFeatures,
     PlaceholderRangeInfo,
 )
+from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 from vllm.multimodal.inputs import (
     MultiModalBatchedField,
     MultiModalFieldElem,
     MultiModalFlatField,
     MultiModalKwargsItem,
     MultiModalSharedField,
+    PlaceholderRange,
 )
+
+
+def test_placeholder_range_info_is_embed_roundtrip():
+    """PlaceholderRangeInfo preserves optional embed masks through JSON mode."""
+    info = PlaceholderRangeInfo(
+        offset=1,
+        length=3,
+        is_embed=[False, True, False],
+    )
+
+    payload = info.model_dump(mode="json")
+    restored = PlaceholderRangeInfo.model_validate(payload)
+
+    assert payload == {
+        "offset": 1,
+        "length": 3,
+        "is_embed": [False, True, False],
+    }
+    assert restored.is_embed == [False, True, False]
+
+
+def test_placeholder_range_info_accepts_legacy_payload_without_is_embed():
+    """Old /generate payloads omit is_embed and keep whole-range semantics."""
+    restored = PlaceholderRangeInfo.model_validate({"offset": 1, "length": 3})
+
+    assert restored.is_embed is None
+
+
+def test_placeholder_range_info_rejects_mismatched_is_embed_length():
+    with pytest.raises(ValidationError, match="is_embed length must match"):
+        PlaceholderRangeInfo(offset=1, length=3, is_embed=[True, False])
+
+
+def test_extract_mm_features_serializes_placeholder_is_embed_mask():
+    """Render features expose Gemma4-style sparse embed masks as JSON bools."""
+    engine_input = {
+        "type": "multimodal",
+        "prompt_token_ids": [1, 2, 3],
+        "mm_hashes": {"image": ["hash"]},
+        "mm_placeholders": {
+            "image": [
+                PlaceholderRange(
+                    offset=0,
+                    length=3,
+                    is_embed=torch.tensor([False, True, False]),
+                )
+            ]
+        },
+    }
+
+    features = OpenAIServingRender._extract_mm_features(engine_input)
+
+    assert features is not None
+    placeholder = features.mm_placeholders["image"][0]
+    assert placeholder.is_embed == [False, True, False]
+    assert features.model_dump(mode="json")["mm_placeholders"]["image"][0][
+        "is_embed"
+    ] == [False, True, False]
 
 
 def test_mm_kwargs_item_roundtrip():

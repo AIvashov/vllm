@@ -171,7 +171,9 @@ class StructuredOutputManager:
         request.structured_output_request.grammar = grammar  # type: ignore[assignment]
 
     def _create_grammar(self, request: "Request") -> StructuredOutputGrammar:
-        key = request.structured_output_request.structured_output_key  # type: ignore[union-attr]
+        structured_output_request = request.structured_output_request
+        assert structured_output_request is not None
+        key = structured_output_request.structured_output_key
 
         # Note that the request was validated in the engine core client,
         # so at this point we know it is a supported type of request.
@@ -181,7 +183,21 @@ class StructuredOutputManager:
         request_type, grammar_spec = key
 
         assert self.backend is not None
-        return self.backend.compile_grammar(request_type, grammar_spec)
+        grammar = self.backend.compile_grammar(request_type, grammar_spec)
+
+        resume_token_ids = structured_output_request.resume_token_ids
+        if resume_token_ids:
+            accepted = grammar.accept_tokens(request.request_id, resume_token_ids)
+            if not accepted:
+                logger.warning(
+                    "structured_output_resume_token_ids are not accepted by "
+                    "grammar for request %s; continuing without resume replay",
+                    request.request_id,
+                )
+                grammar.reset()
+                structured_output_request.resume_replay_failed = True
+
+        return grammar
 
     def _fill_bitmasks(
         self, batch: Iterable[tuple[StructuredOutputGrammar, int, bool]]
