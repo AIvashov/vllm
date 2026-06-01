@@ -171,7 +171,7 @@ def _silu_mul_quant_fp8_packed_kernel(
 
     pid_pack = tl.program_id(0)
     pid_m = tl.program_id(1)
-    m_offset = pid_m * BLOCK_M
+    m_offset = pid_m.to(tl.int64) * BLOCK_M
 
     if m_offset >= M:
         return
@@ -255,7 +255,7 @@ def silu_mul_quant_fp8_packed_triton(
     if output_q is None:
         output_q = torch.empty((M, N_2), dtype=fp8_dtype, device=input.device)
 
-    output_scale_packed = torch.zeros(
+    output_scale_packed = torch.empty(
         (num_packed_groups, tma_aligned_M),
         dtype=torch.int32,
         device=input.device,
@@ -323,8 +323,8 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     pid_n = tl.program_id(1)
     N_2 = N // 2
 
-    m_offset = pid_m * BLOCK_M
-    n_offset = pid_n * BLOCK_N
+    m_offset = pid_m.to(tl.int64) * BLOCK_M
+    n_offset = pid_n.to(tl.int64) * BLOCK_N
     if m_offset >= M:
         return
 
@@ -573,7 +573,7 @@ def per_token_group_quant_fp8(
         shape = x.shape[:-1] + (x.shape[-1] // group_size,)
         x_s = torch.empty(shape, device=x.device, dtype=torch.float32)
 
-    # prefer CUDA kernel if available
+    # prefer CUDA/XPU kernel if available
     # TODO(bnell): this causes some fp8 moe test to fail.
     if current_platform.is_cuda() and x.is_contiguous():
         torch.ops._C.per_token_group_fp8_quant(
@@ -587,6 +587,12 @@ def per_token_group_quant_fp8(
             use_ue8m0,
             column_major_scales,
             tma_aligned_scales,
+        )
+        return x_q, x_s
+
+    if current_platform.is_xpu() and x.is_contiguous():
+        torch.ops._C.per_token_group_fp8_quant(
+            x, x_q, x_s, group_size, eps, fp8_min, fp8_max, use_ue8m0
         )
         return x_q, x_s
 
@@ -861,7 +867,7 @@ def w8a8_triton_block_scaled_mm(
     # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
     # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
     # so decode them to fp32 before launching the kernel.
-    if current_platform.is_rocm():
+    if current_platform.is_rocm() or current_platform.is_xpu():
         if As.dtype == torch.float8_e8m0fnu:
             As = _upcast_e8m0_to_fp32(As).contiguous()
         if Bs.dtype == torch.float8_e8m0fnu:
@@ -1260,7 +1266,7 @@ def process_fp8_weight_tensor_strategy(
         requantize_with_max_scale,
     )
 
-    if current_platform.is_fp8_fnuz():
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
         weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
@@ -1286,7 +1292,7 @@ def process_fp8_weight_channel_strategy(
         normalize_e4m3fn_to_e4m3fnuz,
     )
 
-    if current_platform.is_fp8_fnuz():
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
         weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale, input_scale=input_scale
         )
@@ -1303,7 +1309,7 @@ def process_fp8_weight_block_strategy(
         normalize_e4m3fn_to_e4m3fnuz,
     )
 
-    if current_platform.is_fp8_fnuz():
+    if current_platform.is_fp8_fnuz() and weight.dtype == torch.float8_e4m3fn:
         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
             weight=weight, weight_scale=weight_scale
         )
